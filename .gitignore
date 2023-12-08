@@ -103,3 +103,4 @@ ENV/
 
 state.json
 inputs/
+.vscode

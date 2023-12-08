@@ -1,6 +1,6 @@
 {
     "postgres_host": "localhost",
-    "postgres_port": 5432,
+    "postgres_port": 5435,
     "postgres_database": "singer",
     "postgres_username": "singer",
     "postgres_password": "singer"
