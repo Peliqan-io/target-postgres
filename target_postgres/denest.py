@@ -113,6 +113,7 @@ def _create_subtable(table_path, table_json_schema, key_prop_schemas, subtables,
     }
 
     for i in range(0, level + 1):
+        key_properties.append(singer.LEVEL_FMT.format(i))
         new_properties[singer.LEVEL_FMT.format(i)] = {
             'type': ['integer']
         }
