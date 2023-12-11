@@ -629,7 +629,6 @@ class SQLInterface:
             if not existing_table:
                 for column_names in self.new_table_indexes(schema):
                     self.add_index(connection, table_name, column_names)
-                
                 self.add_primary_key(connection, table_name, schema.get('key_properties', None))
 
             return self._get_table_schema(connection, table_name)
