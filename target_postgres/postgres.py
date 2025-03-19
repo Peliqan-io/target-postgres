@@ -348,6 +348,7 @@ class PostgresTarget(SQLInterface):
                         version))
                 else:
                     versioned_root_table = root_table_name + SEPARATOR + str(version)
+                    versioned_root_table = versioned_root_table[:self.IDENTIFIER_FIELD_LENGTH]
 
                     names_to_paths = dict([(v, k) for k, v in self.table_mapping_cache.items()])
 
