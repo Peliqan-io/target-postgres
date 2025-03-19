@@ -861,7 +861,6 @@ class SQLInterface:
                                 table_batch['streamed_schema']['path']
                             ))
 
-                            self.LOGGER.info(table_batch)
                             remote_schema = self.upsert_table_helper(connection,
                                                                      table_batch['streamed_schema'],
                                                                      metadata)

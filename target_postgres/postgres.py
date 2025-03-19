@@ -629,8 +629,6 @@ class PostgresTarget(SQLInterface):
     def write_table_batch(self, cur, table_batch, metadata):
         remote_schema = table_batch['remote_schema']
 
-        self.LOGGER.info(table_batch)
-
         ## Create temp table to upload new data to
         target_table_name = self.canonicalize_identifier('tmp_' + str(uuid.uuid4()))
         cur.execute(sql.SQL('''
