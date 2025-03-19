@@ -361,7 +361,14 @@ class PostgresTarget(SQLInterface):
 
                     for versioned_table_name in map(lambda x: x[0], cur.fetchall()):
                         table_name = root_table_name + versioned_table_name[len(versioned_root_table):]
+
                         table_path = names_to_paths[table_name]
+                        old_table_name = table_name + SEPARATOR + 'old'
+                        if len(old_table_name) > self.IDENTIFIER_FIELD_LENGTH:
+                            unique_suffix = self.canonicalize_identifier(str(uuid.uuid4()) + SEPARATOR + 'old')
+                            old_table_name = table_name[:len(table_name) - len(unique_suffix)]
+                            old_table_name += unique_suffix
+
                         cur.execute(sql.SQL('''
                             ALTER TABLE {table_schema}.{stream_table} RENAME TO {stream_table_old};
                             ALTER TABLE {table_schema}.{version_table} RENAME TO {stream_table};
@@ -369,9 +376,7 @@ class PostgresTarget(SQLInterface):
                             COMMIT;
                         ''').format(
                             table_schema=sql.Identifier(self.postgres_schema),
-                            stream_table_old=sql.Identifier(table_name +
-                                                            SEPARATOR +
-                                                            'old'),
+                            stream_table_old=sql.Identifier(old_table_name),
                             stream_table=sql.Identifier(table_name),
                             version_table=sql.Identifier(versioned_table_name)))
                         metadata = self._get_table_metadata(cur, table_name)
