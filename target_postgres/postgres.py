@@ -714,8 +714,8 @@ class PostgresTarget(SQLInterface):
         index_name = 'tp_{}_{}_idx'.format(table_name, "_".join(column_names))
 
         if len(index_name) > self.IDENTIFIER_FIELD_LENGTH:
-            index_name_hash = hashlib.sha1(index_name.encode('utf-8')).hexdigest()[0:60]
-            index_name = 'tp_{}'.format(index_name_hash)
+            index_name = self.canonicalize_identifier(str(uuid.uuid4()))
+            index_name = 'tp_{}'.format(index_name)
 
         cur.execute(sql.SQL('''
             CREATE INDEX {index_name}
