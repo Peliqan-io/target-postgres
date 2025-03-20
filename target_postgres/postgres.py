@@ -366,7 +366,7 @@ class PostgresTarget(SQLInterface):
                         old_table_name = table_name + SEPARATOR + 'old'
                         if len(old_table_name) > self.IDENTIFIER_FIELD_LENGTH:
                             unique_suffix = self.canonicalize_identifier(str(uuid.uuid4()) + SEPARATOR + 'old')
-                            old_table_name = table_name[:len(table_name) - len(unique_suffix)]
+                            old_table_name = table_name[:self.IDENTIFIER_FIELD_LENGTH - len(unique_suffix)]
                             old_table_name += unique_suffix
 
                         cur.execute(sql.SQL('''
