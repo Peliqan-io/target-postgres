@@ -64,6 +64,10 @@ class StreamTracker:
 
     def _write_batch_and_update_watermarks(self, stream):
         stream_buffer = self.streams[stream]
+        if len(stream_buffer.stream) >= self.target.IDENTIFIER_FIELD_LENGTH:
+            # separator length also included
+            max_length = self.target.IDENTIFIER_FIELD_LENGTH - 2 - len(str(stream_buffer.max_version))
+            stream_buffer.stream = stream_buffer.stream[:max_length]
         self.target.write_batch(stream_buffer)
         stream_buffer.flush_buffer()
         self.stream_flush_watermarks[stream] = self.stream_add_watermarks.get(stream, 0)
