@@ -348,6 +348,7 @@ class PostgresTarget(SQLInterface):
                         version))
                 else:
                     versioned_root_table = root_table_name + SEPARATOR + str(version)
+                    versioned_root_table = versioned_root_table[:self.IDENTIFIER_FIELD_LENGTH]
 
                     names_to_paths = dict([(v, k) for k, v in self.table_mapping_cache.items()])
 
@@ -360,7 +361,14 @@ class PostgresTarget(SQLInterface):
 
                     for versioned_table_name in map(lambda x: x[0], cur.fetchall()):
                         table_name = root_table_name + versioned_table_name[len(versioned_root_table):]
+
                         table_path = names_to_paths[table_name]
+                        old_table_name = table_name + SEPARATOR + 'old'
+                        if len(old_table_name) > self.IDENTIFIER_FIELD_LENGTH:
+                            unique_suffix = self.canonicalize_identifier(str(uuid.uuid4()) + SEPARATOR + 'old')
+                            old_table_name = table_name[:self.IDENTIFIER_FIELD_LENGTH - len(unique_suffix)]
+                            old_table_name += unique_suffix
+
                         cur.execute(sql.SQL('''
                             ALTER TABLE {table_schema}.{stream_table} RENAME TO {stream_table_old};
                             ALTER TABLE {table_schema}.{version_table} RENAME TO {stream_table};
@@ -368,9 +376,7 @@ class PostgresTarget(SQLInterface):
                             COMMIT;
                         ''').format(
                             table_schema=sql.Identifier(self.postgres_schema),
-                            stream_table_old=sql.Identifier(table_name +
-                                                            SEPARATOR +
-                                                            'old'),
+                            stream_table_old=sql.Identifier(old_table_name),
                             stream_table=sql.Identifier(table_name),
                             version_table=sql.Identifier(versioned_table_name)))
                         metadata = self._get_table_metadata(cur, table_name)
@@ -708,8 +714,8 @@ class PostgresTarget(SQLInterface):
         index_name = 'tp_{}_{}_idx'.format(table_name, "_".join(column_names))
 
         if len(index_name) > self.IDENTIFIER_FIELD_LENGTH:
-            index_name_hash = hashlib.sha1(index_name.encode('utf-8')).hexdigest()[0:60]
-            index_name = 'tp_{}'.format(index_name_hash)
+            index_name = self.canonicalize_identifier(str(uuid.uuid4()))
+            index_name = 'tp_{}'.format(index_name)
 
         cur.execute(sql.SQL('''
             CREATE INDEX {index_name}
