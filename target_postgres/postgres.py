@@ -311,7 +311,7 @@ class PostgresTarget(SQLInterface):
 
         retry_counter = MAX_RETRY_COUNT
         exception = None
-        while retry_counter > 0:
+        while retry_counter >= 0:
             try:
                 with self.conn.cursor() as cur:
                     try:
@@ -395,20 +395,21 @@ class PostgresTarget(SQLInterface):
                 if 'connection already closed' not in str(ex) and 'cursor already closed' not in str(ex):
                     raise
 
-                if retry_counter == 0:
+                exception = ex
+                if retry_counter <= 0:
                     break
 
-                self.LOGGER.warning('Connection error: {}. Retrying in 30 seconds... Attempt({})'.format(ex, MAX_RETRY_COUNT - retry_counter + 1))
-                # todo: Discuss what the wait interval should be
-                time.sleep(30)
-                retry_counter -= 1
-                exception = ex
+                self.LOGGER.warning('Connection error: {}. Attempting to reconnect'.format(ex))
                 try:
                     # make sure old connection is actually closed
                     self.conn.close()
                 except Exception:
                     pass
+
                 self.conn = self._get_connection()
+                self.LOGGER.info('Re-processing batch Attempt({})'.format(MAX_RETRY_COUNT - retry_counter + 1))
+                retry_counter -= 1
+
 
         raise PostgresError(f"Retry limit exceeded while writing batch to Postgres error={exception}. Exiting...")
 
