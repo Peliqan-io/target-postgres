@@ -131,21 +131,15 @@ class PostgresTarget(SQLInterface):
         **kwargs):
 
         self.config = config
-        connection = self._get_connection(config)
-
-        self.LOGGER.info(
-            'PostgresTarget created with established connection: `{}`, PostgreSQL schema: `{}`'.format(connection.dsn,
-                                                                                                      postgres_schema))
 
         if logging_level:
             level = logging.getLevelName(logging_level)
             self.LOGGER.setLevel(level)
 
-        try:
-            connection.initialize(self.LOGGER)
-            self.LOGGER.debug('PostgresTarget set to log all queries.')
-        except AttributeError:
-            self.LOGGER.debug('PostgresTarget disabling logging all queries.')
+        connection = self._get_connection(config, self.LOGGER)
+        self.LOGGER.info(
+            'PostgresTarget created with established connection: `{}`, PostgreSQL schema: `{}`'.format(connection.dsn,
+                                                                                                      postgres_schema))
 
         self.conn = connection
         self.postgres_schema = postgres_schema
@@ -189,11 +183,11 @@ class PostgresTarget(SQLInterface):
                 version_1_metadata = _update_schema_0_to_1(metadata, table_schema)
                 self._set_table_metadata(cur, mapped_name, version_1_metadata)
 
-    def _get_connection(self, config=None):
+    def _get_connection(self, config=None, logger=None):
         if not config:
             config = self.config
 
-        return psycopg2.connect(
+        connection = psycopg2.connect(
             connection_factory=MillisLoggingConnection,
             host=config.get('postgres_host', 'localhost'),
             port=config.get('postgres_port', 5432),
@@ -212,6 +206,16 @@ class PostgresTarget(SQLInterface):
             keepalives_interval=10,
             keepalives_count=5
         )
+
+        if not logger:
+            logger = self.LOGGER
+        try:
+            connection.initialize(logger)
+            self.LOGGER.debug('PostgresTarget set to log all queries.')
+        except AttributeError:
+            self.LOGGER.debug('PostgresTarget disabling logging all queries.')
+
+        return connection
 
     def _update_schemas_1_to_2(self, cur):
         """
