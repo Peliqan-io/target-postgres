@@ -22,7 +22,7 @@ from target_postgres.sql_base import SEPARATOR, SQLInterface
 
 RESERVED_NULL_DEFAULT = 'NULL'
 MAX_RETRY_COUNT = 5
-RETRY_INTERVAL = 60 # seconds
+RETRY_INTERVAL = 120 # seconds
 @lru_cache(maxsize=128)
 def _format_datetime(value):
     """
