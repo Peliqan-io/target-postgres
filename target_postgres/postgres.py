@@ -21,7 +21,7 @@ from target_postgres.sql_base import SEPARATOR, SQLInterface
 
 
 RESERVED_NULL_DEFAULT = 'NULL'
-
+MAX_RETRY_COUNT = 5
 @lru_cache(maxsize=128)
 def _format_datetime(value):
     """
@@ -284,7 +284,7 @@ class PostgresTarget(SQLInterface):
         if not self.persist_empty_tables and stream_buffer.count == 0:
             return None
 
-        retry_counter = 5
+        retry_counter = MAX_RETRY_COUNT
         exception = None
         while retry_counter > 0:
             try:
@@ -366,16 +366,26 @@ class PostgresTarget(SQLInterface):
                         message = 'Exception writing records'
                         self.LOGGER.exception(message)
                         raise PostgresError(message, ex)
-            except psycopg2.OperationalError as ex:
-                if 'connection has been closed unexpectedly' not in str(ex):
+            except Exception as ex:
+                if 'connection already closed' not in str(ex) and 'cursor already closed' not in str(ex):
                     raise
 
+                if retry_counter == 0:
+                    break
+
+                self.LOGGER.warning('Connection error: {}. Retrying in 30 seconds... Attempt({})'.format(ex, MAX_RETRY_COUNT - retry_counter + 1))
+                # todo: Discuss what the wait interval should be
                 time.sleep(30)
                 retry_counter -= 1
                 exception = ex
+                try:
+                    # make sure old connection is actually closed
+                    self.conn.close()
+                except Exception:
+                    pass
                 self.conn = self._get_connection()
 
-        raise PostgresError(f"Retry limit exceeded while writing batch to Postgres error={exception}")
+        raise PostgresError(f"Retry limit exceeded while writing batch to Postgres error={exception}. Exiting...")
 
     def activate_version(self, stream_buffer, version):
         with self.conn.cursor() as cur:
