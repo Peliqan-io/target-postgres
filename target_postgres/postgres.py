@@ -22,6 +22,7 @@ from target_postgres.sql_base import SEPARATOR, SQLInterface
 
 RESERVED_NULL_DEFAULT = 'NULL'
 MAX_RETRY_COUNT = 5
+RETRY_INTERVAL = 60 # seconds
 @lru_cache(maxsize=128)
 def _format_datetime(value):
     """
@@ -136,10 +137,7 @@ class PostgresTarget(SQLInterface):
             level = logging.getLevelName(logging_level)
             self.LOGGER.setLevel(level)
 
-        connection = self._get_connection(config, self.LOGGER)
-        self.LOGGER.info(
-            'PostgresTarget created with established connection: `{}`, PostgreSQL schema: `{}`'.format(connection.dsn,
-                                                                                                      postgres_schema))
+        connection = self._get_connection(config, postgres_schema, self.LOGGER)
 
         self.conn = connection
         self.postgres_schema = postgres_schema
@@ -183,39 +181,66 @@ class PostgresTarget(SQLInterface):
                 version_1_metadata = _update_schema_0_to_1(metadata, table_schema)
                 self._set_table_metadata(cur, mapped_name, version_1_metadata)
 
-    def _get_connection(self, config=None, logger=None):
+    def _get_connection(self, config=None, postgres_schema=None, logger=None):
         if not config:
             config = self.config
 
-        connection = psycopg2.connect(
-            connection_factory=MillisLoggingConnection,
-            host=config.get('postgres_host', 'localhost'),
-            port=config.get('postgres_port', 5432),
-            dbname=config.get('postgres_database'),
-            user=config.get('postgres_username'),
-            password=config.get('postgres_password'),
-            sslmode=config.get('postgres_sslmode'),
-            sslcert=config.get('postgres_sslcert'),
-            sslkey=config.get('postgres_sslkey'),
-            sslrootcert=config.get('postgres_sslrootcert'),
-            sslcrl=config.get('postgres_sslcrl'),
-            application_name=config.get('application_name', 'target-postgres'),
-            # Keep alive the idle connection indefinitely ( Some taps are bit slow, which causes the idle time )
-            keepalives=1,
-            keepalives_idle=30,
-            keepalives_interval=10,
-            keepalives_count=5
-        )
+        if not postgres_schema:
+            postgres_schema = self.postgres_schema
 
         if not logger:
             logger = self.LOGGER
-        try:
-            connection.initialize(logger)
-            self.LOGGER.debug('PostgresTarget set to log all queries.')
-        except AttributeError:
-            self.LOGGER.debug('PostgresTarget disabling logging all queries.')
 
-        return connection
+        retry_counter = MAX_RETRY_COUNT
+        while retry_counter >= 0:
+            try:
+                connection = psycopg2.connect(
+                    connection_factory=MillisLoggingConnection,
+                    host=config.get('postgres_host', 'localhost'),
+                    port=config.get('postgres_port', 5432),
+                    dbname=config.get('postgres_database'),
+                    user=config.get('postgres_username'),
+                    password=config.get('postgres_password'),
+                    sslmode=config.get('postgres_sslmode'),
+                    sslcert=config.get('postgres_sslcert'),
+                    sslkey=config.get('postgres_sslkey'),
+                    sslrootcert=config.get('postgres_sslrootcert'),
+                    sslcrl=config.get('postgres_sslcrl'),
+                    application_name=config.get('application_name', 'target-postgres'),
+                    # Keep alive the idle connection indefinitely ( Some taps are bit slow, which causes the idle time )
+                    keepalives=1,
+                    keepalives_idle=30,
+                    keepalives_interval=10,
+                    keepalives_count=5
+                )
+
+                self.LOGGER.info(
+                    'PostgresTarget created with established connection: `{}`, PostgreSQL schema: `{}`'.format(
+                        connection.dsn,
+                        postgres_schema
+                    )
+                )
+
+                try:
+                    connection.initialize(logger)
+                    self.LOGGER.debug('PostgresTarget set to log all queries.')
+                except AttributeError:
+                    self.LOGGER.debug('PostgresTarget disabling logging all queries.')
+
+                connection.rollback()
+                return connection
+
+            except Exception:
+                if retry_counter <= 0:
+                    break
+
+                self.LOGGER.exception('Failed to connect to Postgres. Retrying in {} seconds... Attempt({})'.format(RETRY_INTERVAL, MAX_RETRY_COUNT - retry_counter + 1))
+                time.sleep(RETRY_INTERVAL)
+
+                retry_counter -= 1
+
+
+        raise PostgresError('Failed to connect to Postgres after {} retries. Exiting...'.format(MAX_RETRY_COUNT))
 
     def _update_schemas_1_to_2(self, cur):
         """
