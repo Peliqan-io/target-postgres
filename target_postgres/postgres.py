@@ -7,6 +7,8 @@ import logging
 import re
 import time
 import uuid
+
+import psycopg2
 import regex
 
 import arrow
@@ -121,16 +123,19 @@ class PostgresTarget(SQLInterface):
     # TODO: Figure out way to `SELECT` value from commands
     IDENTIFIER_FIELD_LENGTH = 63
 
-    def __init__(self, connection, *args,
+    def __init__(self, config, *args,
         postgres_schema='public',
         logging_level=None,
         persist_empty_tables=False,
         add_upsert_indexes=True,
         **kwargs):
 
+        self.config = config
+        connection = self._get_connection(config)
+
         self.LOGGER.info(
             'PostgresTarget created with established connection: `{}`, PostgreSQL schema: `{}`'.format(connection.dsn,
-                                                                                                       postgres_schema))
+                                                                                                      postgres_schema))
 
         if logging_level:
             level = logging.getLevelName(logging_level)
@@ -183,6 +188,30 @@ class PostgresTarget(SQLInterface):
                 table_schema = self.__get_table_schema(cur, mapped_name)
                 version_1_metadata = _update_schema_0_to_1(metadata, table_schema)
                 self._set_table_metadata(cur, mapped_name, version_1_metadata)
+
+    def _get_connection(self, config=None):
+        if not config:
+            config = self.config
+
+        return psycopg2.connect(
+            connection_factory=MillisLoggingConnection,
+            host=config.get('postgres_host', 'localhost'),
+            port=config.get('postgres_port', 5432),
+            dbname=config.get('postgres_database'),
+            user=config.get('postgres_username'),
+            password=config.get('postgres_password'),
+            sslmode=config.get('postgres_sslmode'),
+            sslcert=config.get('postgres_sslcert'),
+            sslkey=config.get('postgres_sslkey'),
+            sslrootcert=config.get('postgres_sslrootcert'),
+            sslcrl=config.get('postgres_sslcrl'),
+            application_name=config.get('application_name', 'target-postgres'),
+            # Keep alive the idle connection indefinitely ( Some taps are bit slow, which causes the idle time )
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5
+        )
 
     def _update_schemas_1_to_2(self, cur):
         """
@@ -246,88 +275,103 @@ class PostgresTarget(SQLInterface):
             if table_path:
                 self.table_mapping_cache[tuple(table_path)] = mapped_name
 
+
     def write_batch(self, stream_buffer):
         if not self.persist_empty_tables and stream_buffer.count == 0:
             return None
 
-        with self.conn.cursor() as cur:
+        retry_counter = 5
+        exception = None
+        while retry_counter > 0:
             try:
-                cur.execute('BEGIN;')
+                with self.conn.cursor() as cur:
+                    try:
+                        cur.execute('BEGIN;')
 
-                self.setup_table_mapping_cache(cur)
+                        self.setup_table_mapping_cache(cur)
 
-                root_table_name = self.add_table_mapping_helper((stream_buffer.stream,), self.table_mapping_cache)['to']
-                current_table_schema = self.get_table_schema(cur, root_table_name)
+                        root_table_name = self.add_table_mapping_helper((stream_buffer.stream,), self.table_mapping_cache)['to']
+                        current_table_schema = self.get_table_schema(cur, root_table_name)
 
-                current_table_version = None
+                        current_table_version = None
 
-                if current_table_schema:
-                    current_table_version = current_table_schema.get('version', None)
+                        if current_table_schema:
+                            current_table_version = current_table_schema.get('version', None)
 
-                    if set(stream_buffer.key_properties) \
-                            != set(current_table_schema.get('key_properties')):
-                        raise PostgresError(
-                            '`key_properties` change detected. Existing values are: {}. Streamed values are: {}'.format(
-                                current_table_schema.get('key_properties'),
-                                stream_buffer.key_properties
-                            ))
+                            if set(stream_buffer.key_properties) \
+                                    != set(current_table_schema.get('key_properties')):
+                                raise PostgresError(
+                                    '`key_properties` change detected. Existing values are: {}. Streamed values are: {}'.format(
+                                        current_table_schema.get('key_properties'),
+                                        stream_buffer.key_properties
+                                    ))
 
-                    for key_property in stream_buffer.key_properties:
-                        canonicalized_key, remote_column_schema = self.fetch_column_from_path((key_property,),
-                                                                                              current_table_schema)
-                        if self.json_schema_to_sql_type(remote_column_schema) \
-                                != self.json_schema_to_sql_type(stream_buffer.schema['properties'][key_property]):
-                            raise PostgresError(
-                                ('`key_properties` type change detected for "{}". ' +
-                                 'Existing values are: {}. ' +
-                                 'Streamed values are: {}, {}, {}').format(
-                                    key_property,
-                                    json_schema.get_type(current_table_schema['schema']['properties'][key_property]),
-                                    json_schema.get_type(stream_buffer.schema['properties'][key_property]),
-                                    self.json_schema_to_sql_type(
-                                        current_table_schema['schema']['properties'][key_property]),
-                                    self.json_schema_to_sql_type(stream_buffer.schema['properties'][key_property])
-                                ))
+                            for key_property in stream_buffer.key_properties:
+                                canonicalized_key, remote_column_schema = self.fetch_column_from_path((key_property,),
+                                                                                                      current_table_schema)
+                                if self.json_schema_to_sql_type(remote_column_schema) \
+                                        != self.json_schema_to_sql_type(stream_buffer.schema['properties'][key_property]):
+                                    raise PostgresError(
+                                        ('`key_properties` type change detected for "{}". ' +
+                                         'Existing values are: {}. ' +
+                                         'Streamed values are: {}, {}, {}').format(
+                                            key_property,
+                                            json_schema.get_type(current_table_schema['schema']['properties'][key_property]),
+                                            json_schema.get_type(stream_buffer.schema['properties'][key_property]),
+                                            self.json_schema_to_sql_type(
+                                                current_table_schema['schema']['properties'][key_property]),
+                                            self.json_schema_to_sql_type(stream_buffer.schema['properties'][key_property])
+                                        ))
 
-                target_table_version = current_table_version or stream_buffer.max_version
+                        target_table_version = current_table_version or stream_buffer.max_version
 
-                self.LOGGER.info('Stream {} ({}) with max_version {} targetting {}'.format(
-                    stream_buffer.stream,
-                    root_table_name,
-                    stream_buffer.max_version,
-                    target_table_version
-                ))
+                        self.LOGGER.info('Stream {} ({}) with max_version {} targetting {}'.format(
+                            stream_buffer.stream,
+                            root_table_name,
+                            stream_buffer.max_version,
+                            target_table_version
+                        ))
 
-                root_table_name = stream_buffer.stream
-                if current_table_version is not None and \
-                        stream_buffer.max_version is not None:
-                    if stream_buffer.max_version < current_table_version:
-                        self.LOGGER.warning('{} - Records from an earlier table version detected.'
-                                            .format(stream_buffer.stream))
+                        root_table_name = stream_buffer.stream
+                        if current_table_version is not None and \
+                                stream_buffer.max_version is not None:
+                            if stream_buffer.max_version < current_table_version:
+                                self.LOGGER.warning('{} - Records from an earlier table version detected.'
+                                                    .format(stream_buffer.stream))
+                                cur.execute('ROLLBACK;')
+                                return None
+
+                            elif stream_buffer.max_version > current_table_version:
+                                root_table_name += SEPARATOR + str(stream_buffer.max_version)
+                                target_table_version = stream_buffer.max_version
+
+                        self.LOGGER.info('Root table name {}'.format(root_table_name))
+
+                        written_batches_details = self.write_batch_helper(cur,
+                                                                          root_table_name,
+                                                                          stream_buffer.schema,
+                                                                          stream_buffer.key_properties,
+                                                                          stream_buffer.get_batch(),
+                                                                          {'version': target_table_version})
+
+                        cur.execute('COMMIT;')
+
+                        return written_batches_details
+                    except Exception as ex:
                         cur.execute('ROLLBACK;')
-                        return None
+                        message = 'Exception writing records'
+                        self.LOGGER.exception(message)
+                        raise PostgresError(message, ex)
+            except psycopg2.OperationalError as ex:
+                if 'connection has been closed unexpectedly' not in str(ex):
+                    raise
 
-                    elif stream_buffer.max_version > current_table_version:
-                        root_table_name += SEPARATOR + str(stream_buffer.max_version)
-                        target_table_version = stream_buffer.max_version
+                time.sleep(30)
+                retry_counter -= 1
+                exception = ex
+                self.conn = self._get_connection()
 
-                self.LOGGER.info('Root table name {}'.format(root_table_name))
-
-                written_batches_details = self.write_batch_helper(cur,
-                                                                  root_table_name,
-                                                                  stream_buffer.schema,
-                                                                  stream_buffer.key_properties,
-                                                                  stream_buffer.get_batch(),
-                                                                  {'version': target_table_version})
-
-                cur.execute('COMMIT;')
-
-                return written_batches_details
-            except Exception as ex:
-                cur.execute('ROLLBACK;')
-                message = 'Exception writing records'
-                self.LOGGER.exception(message)
-                raise PostgresError(message, ex)
+        raise PostgresError(f"Retry limit exceeded while writing batch to Postgres error={exception}")
 
     def activate_version(self, stream_buffer, version):
         with self.conn.cursor() as cur:
@@ -707,7 +751,7 @@ class PostgresTarget(SQLInterface):
             pk_identifier = sql.Identifier(pk)
             pk_temp_select_list.append(sql.SQL('{}.{}::varchar').format(full_temp_table_name, pk_identifier))
             pk_temp_select_dedupped_list.append(sql.SQL('"dedupped".{}::varchar').format(pk_identifier))
-            
+
             pk_where_list.append(
                 sql.SQL('{table}.{pk} = "dedupped".{pk}').format(
                     table=full_table_name,
@@ -823,7 +867,7 @@ class PostgresTarget(SQLInterface):
 
     def serialize_table_record_datetime_value(self, remote_schema, streamed_schema, field, value):
         return _format_datetime(value)
-    
+
     def serialize_table_record_date_value(self, remote_schema, streamed_schema, field, value):
         return _format_date(value)
 
@@ -1150,4 +1194,3 @@ class PostgresTarget(SQLInterface):
             sql_type += ' NOT NULL'
 
         return sql_type
-        
