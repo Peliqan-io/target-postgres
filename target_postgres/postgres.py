@@ -392,7 +392,11 @@ class PostgresTarget(SQLInterface):
                         self.LOGGER.exception(message)
                         raise PostgresError(message, ex)
             except Exception as ex:
-                if 'connection already closed' not in str(ex) and 'cursor already closed' not in str(ex):
+                if (
+                        'connection already closed' not in str(ex) and
+                        'cursor already closed' not in str(ex) and
+                        'connection has been closed unexpectedly' not in str(ex)
+                ):
                     raise
 
                 exception = ex
