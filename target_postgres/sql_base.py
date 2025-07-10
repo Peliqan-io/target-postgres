@@ -245,19 +245,14 @@ class SQLInterface:
         raw_canonicalized_name = self.canonicalize_identifier(name)
         canonicalized_name = self.canonicalize_identifier(raw_canonicalized_name[:self.IDENTIFIER_FIELD_LENGTH])
 
-        i = 0
         ## NAME COLLISION
-        while canonicalized_name in to_from:
-            self.LOGGER.warning(
+        if canonicalized_name in to_from:
+            raise Exception(
                 'NAME COLLISION: Table `{}` collided with `{}` in remote. Adding new integer suffix...'.format(
                     from_path,
                     canonicalized_name
-                ))
-
-            i += 1
-            suffix = SEPARATOR + str(i)
-            canonicalized_name = self.canonicalize_identifier(raw_canonicalized_name[
-                                   :self.IDENTIFIER_FIELD_LENGTH - len(suffix)] + suffix)
+                )
+            )
 
         return {'exists': False, 'to': canonicalized_name}
 
