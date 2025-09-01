@@ -660,34 +660,42 @@ class PostgresTarget(SQLInterface):
                                 f"{view_data}"
                             )
 
-                            cur.execute(
-                                sql.SQL(
-                                    '''
-                                    CREATE {object_type} {schema_name}.{view_name} AS {query} {check_option_fragment};
-                                    '''
-                                ).format(
-                                    object_type=sql.SQL(object_type),
-                                    schema_name=sql.Identifier(schema_name),
-                                    view_name=sql.Identifier(view_name),
-                                    query=sql.SQL(query),
-                                    check_option_fragment=sql.SQL(check_option_fragment),
+                            try:
+                                cur.execute(
+                                    sql.SQL(
+                                        '''
+                                        CREATE {object_type} {schema_name}.{view_name} AS {query} {check_option_fragment};
+                                        '''
+                                    ).format(
+                                        object_type=sql.SQL(object_type),
+                                        schema_name=sql.Identifier(schema_name),
+                                        view_name=sql.Identifier(view_name),
+                                        query=sql.SQL(query),
+                                        check_option_fragment=sql.SQL(check_option_fragment),
+                                    )
                                 )
-                            )
 
-                            cur.execute(
-                                sql.SQL(
-                                    '''
-                                    ALTER {object_type} {schema_name}.{view_name} OWNER TO {view_owner};
-                                    '''
-                                ).format(
-                                    object_type=sql.SQL(object_type),
-                                    schema_name=sql.Identifier(schema_name),
-                                    view_name=sql.Identifier(view_name),
-                                    view_owner=sql.Identifier(view_owner),
+                                cur.execute(
+                                    sql.SQL(
+                                        '''
+                                        ALTER {object_type} {schema_name}.{view_name} OWNER TO {view_owner};
+                                        '''
+                                    ).format(
+                                        object_type=sql.SQL(object_type),
+                                        schema_name=sql.Identifier(schema_name),
+                                        view_name=sql.Identifier(view_name),
+                                        view_owner=sql.Identifier(view_owner),
+                                    )
                                 )
-                            )
 
-                        cur.execute('COMMIT;')
+                                cur.execute('COMMIT;')
+                            except Exception as ex:
+                                cur.execute('ROLLBACK;')
+                                message = '{} - Exception re-creating view {}: {}'.format(
+                                    stream_buffer.stream,
+                                    view_name,
+                                    ex)
+                                self.LOGGER.exception(message)
 
                         metadata = self._get_table_metadata(cur, table_name)
 
