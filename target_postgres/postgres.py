@@ -282,10 +282,21 @@ class PostgresTarget(SQLInterface):
                 root_version_2_metadata = _update_schema_1_to_2(metadata, table_path[0:1])
                 self._set_table_metadata(cur, mapped_name, root_version_2_metadata)
 
-    def _fetch_direct_dependencies(self, cur, table_schema, stream_table, depth=0):
+    def _fetch_direct_dependencies(self, cur, table_schema, stream_table, depth=0, visited=None, ordered_deps=None):
         """ Recursively fetch all views that depend on the given table or view """
         if depth > 20:
             raise PostgresError(f"Maximum view dependency depth exceeded for {table_schema}.{stream_table}")
+        
+        if visited is None:
+            visited = set()
+        if ordered_deps is None:
+            ordered_deps = []
+
+        dep_object = (table_schema, stream_table)
+        if dep_object in visited:
+            return ordered_deps
+        
+        visited.add(dep_object)
         
         self.LOGGER.info(f"Fetching direct dependencies for {table_schema}.{stream_table} at depth {depth}")
 
@@ -354,10 +365,19 @@ class PostgresTarget(SQLInterface):
         for view in data:
             schema_name = view['schema_name']
             view_name = view['view_name']
-            dependent_views = self._fetch_direct_dependencies(cur, schema_name, view_name, depth + 1)
-            data.extend(dependent_views)
 
-        return data
+            ordered_deps = self._fetch_direct_dependencies(cur, schema_name, view_name, depth + 1, visited, ordered_deps)
+
+            add_view_flag = True
+            for dep in ordered_deps:
+                if (schema_name, view_name) == (dep['schema_name'], dep['view_name']):
+                    add_view_flag = False
+                    break
+            
+            if add_view_flag:
+                ordered_deps.append(view)
+
+        return ordered_deps
 
     def metrics_tags(self):
         return {'database': self.conn.get_dsn_parameters().get('dbname', None),
@@ -537,7 +557,6 @@ class PostgresTarget(SQLInterface):
                         
                         
                         data = self._fetch_direct_dependencies(cur, self.postgres_schema, table_name)
-                        data.reverse()
 
                         # drop all dependent views
                         for view_data in data:
