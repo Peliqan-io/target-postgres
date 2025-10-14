@@ -370,6 +370,7 @@ class PostgresTarget(SQLInterface):
 
             add_view_flag = True
             for dep in ordered_deps:
+                # Add dependency only once into the dependency list
                 if (schema_name, view_name) == (dep['schema_name'], dep['view_name']):
                     add_view_flag = False
                     break
@@ -480,7 +481,6 @@ class PostgresTarget(SQLInterface):
                                                                           stream_buffer.get_batch(),
                                                                           {'version': target_table_version})
 
-                        # cur.execute('COMMIT;')
                         self.conn.commit()
 
                         return written_batches_details
