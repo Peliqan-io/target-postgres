@@ -282,104 +282,6 @@ class PostgresTarget(SQLInterface):
                 root_version_2_metadata = _update_schema_1_to_2(metadata, table_path[0:1])
                 self._set_table_metadata(cur, mapped_name, root_version_2_metadata)
 
-    def _fetch_direct_dependencies(self, cur, table_schema, stream_table, depth=0, visited=None, ordered_deps=None):
-        """ Recursively fetch all views that depend on the given table or view """
-        if depth > 20:
-            raise PostgresError(f"Maximum view dependency depth exceeded for {table_schema}.{stream_table}")
-        
-        if visited is None:
-            visited = set()
-        if ordered_deps is None:
-            ordered_deps = []
-
-        dep_object = (table_schema, stream_table)
-        if dep_object in visited:
-            return ordered_deps
-        
-        visited.add(dep_object)
-        
-        self.LOGGER.info(f"Fetching direct dependencies for {table_schema}.{stream_table} at depth {depth}")
-
-        table_view_identifier = f'"{table_schema}"."{stream_table}"'
-        
-        query = sql.SQL('''
-                        WITH target AS ( SELECT to_regclass({table_view_identifier}) AS oid )
-                        SELECT 
-                            dep_view_ns.nspname AS schema_name,
-                            dep_view.relname   AS view_name,
-                            dep_view.relkind   AS view_type,
-                            owner.rolname      AS view_owner,
-                            pg_get_viewdef(dep_view.oid) AS view_definition,
-                            COALESCE(
-                                (
-                                    SELECT v.check_option
-                                    FROM information_schema.views v
-                                    WHERE v.table_schema = dep_view_ns.nspname
-                                    AND v.table_name = dep_view.relname
-                                ),
-                                'NONE'
-                            ) AS check_option
-                        FROM pg_depend d
-                        JOIN target t
-                        ON d.refobjid = t.oid
-                        JOIN pg_rewrite r
-                        ON d.classid = 'pg_rewrite'::regclass
-                        AND d.objid = r.oid
-                        JOIN pg_class dep_view
-                        ON r.ev_class = dep_view.oid
-                        JOIN pg_namespace dep_view_ns
-                        ON dep_view.relnamespace = dep_view_ns.oid
-                        JOIN pg_roles owner
-                        ON dep_view.relowner = owner.oid
-                        WHERE dep_view.relkind IN ('v', 'm')
-                        AND NOT ( dep_view.relname = {stream_table} AND dep_view_ns.nspname = {table_schema} )
-                        GROUP BY 
-                            dep_view.relname, 
-                            dep_view_ns.nspname, 
-                            dep_view.relkind, 
-                            owner.rolname, 
-                            dep_view.oid
-                        ;
-                    ''').format(
-                        table_view_identifier=sql.Literal(table_view_identifier),
-                        stream_table=sql.Literal(stream_table),
-                        table_schema=sql.Literal(table_schema),
-                    )
-
-        cur.execute(query)
-
-        records = cur.fetchall()
-        col = cur.description
-        data = []
-        for record in records:
-            i = 0
-            metadata = {}
-            for cell in record:
-                metadata[col[i].name] = cell
-                i += 1
-
-            data.append(metadata)
-
-        self.LOGGER.info(f"Dependent views found: {data}")
-
-        for view in data:
-            schema_name = view['schema_name']
-            view_name = view['view_name']
-
-            ordered_deps = self._fetch_direct_dependencies(cur, schema_name, view_name, depth + 1, visited, ordered_deps)
-
-            add_view_flag = True
-            for dep in ordered_deps:
-                # Add dependency only once into the dependency list
-                if (schema_name, view_name) == (dep['schema_name'], dep['view_name']):
-                    add_view_flag = False
-                    break
-            
-            if add_view_flag:
-                ordered_deps.append(view)
-
-        return ordered_deps
-
     def metrics_tags(self):
         return {'database': self.conn.get_dsn_parameters().get('dbname', None),
                 'schema': self.postgres_schema}
@@ -481,7 +383,7 @@ class PostgresTarget(SQLInterface):
                                                                           stream_buffer.get_batch(),
                                                                           {'version': target_table_version})
 
-                        self.conn.commit()
+                        cur.execute('COMMIT;')
 
                         return written_batches_details
                     except Exception as ex:
@@ -554,9 +456,146 @@ class PostgresTarget(SQLInterface):
                             old_table_name = table_name[:self.IDENTIFIER_FIELD_LENGTH - len(unique_suffix)]
                             old_table_name += unique_suffix
 
-                        
-                        
-                        data = self._fetch_direct_dependencies(cur, self.postgres_schema, table_name)
+                        # Modified query from
+                        # https://github.com/uktrade/pg-bulk-ingest/pull/235/commits/d6db561a31b91e94f1e6f7260c06e73e0c1dc2c5
+                        cur.execute(
+                            sql.SQL(
+                                '''
+                                -- A view is a row in pg_rewrite, and a corresponding set of rows in pg_depend where:
+                                --
+                                -- 1. There is a row per column that links pg_rewrite with all the columns of all the tables (or
+                                --    other views) in pg_class that the view queries
+                                -- 2. There is also one "internal" row linking the pg_rewrite row with its pg_class entry for the
+                                --    view itself. This can be used to then find the views that query the view, the fully
+                                --    qualified name of the view, as well as its definition.
+                                --
+                                -- So to find all the direct views for a table, we find the rows in pg_depend for 1., and then self
+                                -- join onto pg_depend again for 2. (making sure to not choose the same rows again). To then find
+                                -- all the indirect views, we do the same thing repeatedly using a recursive CTE.
+                                --
+                                -- PostgreSQL does not forbid cycles of views, so we have to make sure we never add a view that has
+                                -- already been added.
+                                
+                                WITH RECURSIVE view_deps AS (
+                                                            -- Non recursive term: direct views on the table
+                                                            SELECT view_depend.refobjid,
+                                                                    array [view_depend.refobjid] as path
+                                                             FROM pg_depend as view_depend,
+                                                                  pg_depend as table_depend
+                                                             WHERE
+                                                               
+                                                               -- Find the rows in pg_rewrite for 1: rows that link the table with the views that query it
+                                                                 table_depend.classid = 'pg_rewrite'::regclass
+                                                               and table_depend.refclassid = 'pg_class'::regclass
+                                                               and table_depend.refobjid = format('%I.%I', {table_schema}, {stream_table})::regclass
+                                                               
+                                                               -- And we can find 2: the pg_class entry for each of the views themselves
+                                                               and view_depend.classid = 'pg_rewrite'::regclass
+                                                               and view_depend.refclassid = 'pg_class'::regclass
+                                                               and view_depend.deptype = 'i'
+                                                               and view_depend.objid = table_depend.objid
+                                                               and view_depend.refobjid != table_depend.refobjid
+                                                             
+                                                             UNION
+                                                             
+                                                             -- Recursive term: views on the views
+                                                             SELECT view_depend.refobjid,
+                                                                    view_deps.path || array [view_depend.refobjid]
+                                                             FROM view_deps,
+                                                                  pg_depend AS view_depend,
+                                                                  pg_depend as table_depend
+                                                             WHERE
+                                                               
+                                                               -- Find the rows in pg_rewrite for 1: rows that link the views with other views that query it
+                                                                 table_depend.classid = 'pg_rewrite'::regclass
+                                                               and table_depend.refclassid = 'pg_class'::regclass
+                                                               and table_depend.refobjid = view_deps.refobjid
+                                                               
+                                                               -- And we can find 2: the pg_class entry for each of the views themselves
+                                                               and view_depend.classid = 'pg_rewrite'::regclass
+                                                               and view_depend.refclassid = 'pg_class'::regclass
+                                                               and view_depend.deptype = 'i'
+                                                               and view_depend.objid = table_depend.objid
+                                                               and view_depend.refobjid != table_depend.refobjid
+                                                               
+                                                               -- Making sure to not get into an infinite cycle
+                                                               and not view_depend.refobjid = ANY (view_deps.path))
+                                                               
+                                -- We now get all the information in order to drop and re-create the views.
+                                SELECT view_deps.refobjid                         as order_id,
+                                       current_database()                         as db_name,
+                                       pg_get_userbyid(c.relowner)                as view_owner,
+                                       c.relkind                                  as view_type,
+                                       dependent_ns.nspname                       as schema_name,
+                                       c.relname                                  as view_name,
+                                       pg_get_viewdef(c.oid)                      as view_definition,
+                                       CASE
+                                           WHEN 'check_option=cascaded'::text = ANY (c.reloptions)
+                                               THEN 'CASCADED'::text
+                                           WHEN 'check_option=local'::text = ANY (c.reloptions)
+                                               THEN 'LOCAL'::text
+                                           ELSE 'NONE'::text
+                                           END::information_schema.character_data AS check_option,
+                                       CASE
+                                           WHEN
+                                               (pg_relation_is_updatable(view_deps.refobjid::regclass, false) & 20) =
+                                               20 THEN 'YES'::text
+                                           ELSE 'NO'::text
+                                           END::information_schema.yes_or_no      AS is_updatable,
+                                       CASE
+                                           WHEN
+                                               (pg_relation_is_updatable(view_deps.refobjid::regclass, false) & 8) =
+                                               8 THEN 'YES'::text
+                                           ELSE 'NO'::text
+                                           END::information_schema.yes_or_no      AS is_insertable_into,
+                                       CASE
+                                           WHEN (EXISTS (SELECT 1
+                                                         FROM pg_trigger
+                                                         WHERE pg_trigger.tgrelid = view_deps.refobjid
+                                                           AND (pg_trigger.tgtype::integer & 81) = 81)) THEN 'YES'::text
+                                           ELSE 'NO'::text
+                                           END::information_schema.yes_or_no      AS is_trigger_updatable,
+                                       CASE
+                                           WHEN (EXISTS (SELECT 1
+                                                         FROM pg_trigger
+                                                         WHERE pg_trigger.tgrelid = view_deps.refobjid
+                                                           AND (pg_trigger.tgtype::integer & 73) = 73)) THEN 'YES'::text
+                                           ELSE 'NO'::text
+                                           END::information_schema.yes_or_no      AS is_trigger_deletable,
+                                       CASE
+                                           WHEN (EXISTS (SELECT 1
+                                                         FROM pg_trigger
+                                                         WHERE pg_trigger.tgrelid = view_deps.refobjid
+                                                           AND (pg_trigger.tgtype::integer & 69) = 69)) THEN 'YES'::text
+                                           ELSE 'NO'::text
+                                           END::information_schema.yes_or_no      AS is_trigger_insertable_into
+                                FROM view_deps
+                                         INNER JOIN
+                                     pg_class c
+                                     ON
+                                         c.oid = view_deps.refobjid
+                                         INNER JOIN pg_namespace dependent_ns
+                                                    ON dependent_ns.oid = c.relnamespace
+                                
+                                -- Use descending order so that leaf nodes get deleted first.
+                                ORDER BY order_id DESC;
+                                '''
+                            ).format(
+                                table_schema=sql.Literal(self.postgres_schema),
+                                stream_table=sql.Literal(table_name),
+                            )
+                        )
+                        records = cur.fetchall()
+                        col = cur.description
+                        data = []
+                        for record in records:
+                            i = 0
+                            metadata = {}
+                            for cell in record:
+                                metadata[col[i].name] = cell
+                                i += 1
+
+                            data.append(metadata)
 
                         # drop all dependent views
                         for view_data in data:
@@ -589,8 +628,6 @@ class PostgresTarget(SQLInterface):
                             stream_table_old=sql.Identifier(old_table_name),
                             stream_table=sql.Identifier(table_name),
                             version_table=sql.Identifier(versioned_table_name)))
-                        
-                        self.conn.commit()
 
                         # re-create all views
                         data.reverse()
@@ -651,14 +688,14 @@ class PostgresTarget(SQLInterface):
                                     )
                                 )
 
-                                self.conn.commit()
+                                cur.execute('COMMIT;')
                             except Exception as ex:
+                                cur.execute('ROLLBACK;')
                                 message = '{} - Exception re-creating view {}: {}'.format(
                                     stream_buffer.stream,
                                     view_name,
                                     ex)
                                 self.LOGGER.exception(message)
-                                self.conn.rollback()
 
                         metadata = self._get_table_metadata(cur, table_name)
 
@@ -670,11 +707,11 @@ class PostgresTarget(SQLInterface):
                         metadata['path'] = table_path
                         self._set_table_metadata(cur, table_name, metadata)
             except Exception as ex:
+                cur.execute('ROLLBACK;')
                 message = '{} - Exception activating table version {}'.format(
                     stream_buffer.stream,
                     version)
                 self.LOGGER.exception(message)
-                self.conn.rollback()
                 raise PostgresError(message, ex)
 
     def _validate_identifier(self, identifier):
