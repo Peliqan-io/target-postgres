@@ -465,7 +465,7 @@ class PostgresTarget(SQLInterface):
                             if stream_buffer.max_version < current_table_version:
                                 self.LOGGER.warning('{} - Records from an earlier table version detected.'
                                                     .format(stream_buffer.stream))
-                                cur.execute('ROLLBACK;')
+                                self.conn.rollback()
                                 return None
 
                             elif stream_buffer.max_version > current_table_version:
@@ -485,9 +485,9 @@ class PostgresTarget(SQLInterface):
 
                         return written_batches_details
                     except Exception as ex:
-                        cur.execute('ROLLBACK;')
                         message = 'Exception writing records'
                         self.LOGGER.exception(message)
+                        self.conn.rollback()
                         raise PostgresError(message, ex)
             except Exception as ex:
                 if (
@@ -1021,6 +1021,7 @@ class PostgresTarget(SQLInterface):
             sql.Identifier(self.postgres_schema),
             sql.Identifier(table_name),
             sql.Literal(json.dumps(metadata))))
+        cur.connection.commit()
 
     def _get_table_metadata(self, cur, table_name):
         cur.execute(sql.SQL('''
