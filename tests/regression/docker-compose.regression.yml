@@ -1,0 +1,32 @@
+version: "3"
+
+# Regression test infrastructure for target-postgres.
+# Provides a clean Postgres instance for both 3.9 and 3.11 runs.
+#
+# Usage:
+#   docker compose -f tests/regression/docker-compose.regression.yml up -d db
+#   bash tests/regression/run_capture_39.sh
+#   bash tests/regression/run_capture_311.sh
+#   bash tests/regression/run_tests.sh
+#   docker compose -f tests/regression/docker-compose.regression.yml down -v
+
+services:
+  db:
+    image: postgres:14
+    environment:
+      POSTGRES_USER: singer
+      POSTGRES_DB: singer
+      POSTGRES_PASSWORD: singer
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U singer"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      - regression
+
+networks:
+  regression:
+    driver: bridge

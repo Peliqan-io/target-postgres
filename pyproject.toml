@@ -33,7 +33,7 @@ packages = [{include = "target_postgres"}]
 python = ">=3.7"
 arrow = "^1.2.3"
 psycopg2 = "^2.9.5"
-singer-python = {git = "https://github.com/peliqan-io/singer-python", branch = "master"}
+singer-python = {git = "https://github.com/peliqan-io/singer-python", branch = "python-311-migration"}
 regex = "2023.6.3"
 
 [tool.poetry.group.tests]
