@@ -17,7 +17,7 @@ from psycopg2.extras import LoggingConnection, LoggingCursor
 
 from target_postgres import json_schema, singer
 from target_postgres.exceptions import PostgresError
-from target_postgres.sql_base import SEPARATOR, SQLInterface
+from target_postgres.sql_base import SEPARATOR, TEMP_TABLE_MARKER, SQLInterface
 
 
 RESERVED_NULL_DEFAULT = 'NULL'
@@ -469,7 +469,11 @@ class PostgresTarget(SQLInterface):
                                 return None
 
                             elif stream_buffer.max_version > current_table_version:
-                                root_table_name += SEPARATOR + str(stream_buffer.max_version)
+                                # Write the new full-table version into a marked staging table
+                                # (pqtemp__<stream>__<version>). activate_version() renames it onto
+                                # the clean stream name, so the published table is never marked. The
+                                # marker keeps the in-flight staging table out of schema discovery.
+                                root_table_name = TEMP_TABLE_MARKER + root_table_name + SEPARATOR + str(stream_buffer.max_version)
                                 target_table_version = stream_buffer.max_version
 
                         self.LOGGER.info('Root table name {}'.format(root_table_name))
@@ -532,7 +536,10 @@ class PostgresTarget(SQLInterface):
                         stream_buffer.stream,
                         version))
                 else:
-                    versioned_root_table = root_table_name + SEPARATOR + str(version)
+                    # Must mirror the staging name built in write_batch() so the LIKE lookup
+                    # below finds the marked version table; the marker is stripped off when
+                    # computing the clean target table_name (table_name = root_table_name + ...).
+                    versioned_root_table = TEMP_TABLE_MARKER + root_table_name + SEPARATOR + str(version)
                     versioned_root_table = versioned_root_table[:self.IDENTIFIER_FIELD_LENGTH]
 
                     names_to_paths = dict([(v, k) for k, v in self.table_mapping_cache.items()])
@@ -917,7 +924,7 @@ class PostgresTarget(SQLInterface):
         remote_schema = table_batch['remote_schema']
 
         ## Create temp table to upload new data to
-        target_table_name = self.canonicalize_identifier('tmp_' + str(uuid.uuid4()))
+        target_table_name = self.canonicalize_identifier(TEMP_TABLE_MARKER + str(uuid.uuid4()))
         cur.execute(sql.SQL('''
             CREATE TABLE {schema}.{temp_table} (LIKE {schema}.{table})
         ''').format(
