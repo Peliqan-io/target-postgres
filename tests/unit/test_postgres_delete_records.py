@@ -67,7 +67,7 @@ class FakeConn:
         self.closed = True
 
 
-def _make_target(cur, schema_props=("ID",)):
+def _make_target(cur, schema_props=("id",)):
     """Build a PostgresTarget without running __init__ (which would connect to PG)."""
     target = PostgresTarget.__new__(PostgresTarget)
     target.conn = FakeConn(cur)
@@ -86,9 +86,10 @@ def _make_target(cur, schema_props=("ID",)):
 
 
 # WHY: happy path — a single batch deletes by PK, commits, returns rowcount.
+#      (The source key "ID" is canonicalized to the physical column "id".)
 def test_deletes_by_single_pk_and_commits():
     cur = FakeCursor(rowcounts=[2])
-    target = _make_target(cur, schema_props=("ID",))
+    target = _make_target(cur, schema_props=("id",))
 
     deleted = target.delete_records("Accounts", [{"ID": "a1"}, {"ID": "a2"}])
 
@@ -97,11 +98,35 @@ def test_deletes_by_single_pk_and_commits():
     assert cur.delete_params() == [["a1", "a2"]]
 
 
+# WHY (#4): source-cased keys must canonicalize to the physical column name. The
+#      write path stores `ID` as `id`; a raw match would no-op silently.
+def test_delete_key_is_canonicalized_to_physical_column():
+    cur = FakeCursor(rowcounts=[1])
+    target = _make_target(cur, schema_props=("id",))
+
+    deleted = target.delete_records("Accounts", [{"ID": "a1"}])
+
+    assert deleted == 1
+    assert cur.delete_params() == [["a1"]]
+
+
+# WHY (#4): canonicalization also replaces invalid identifier chars (space ->
+#      `_`), matching how the column was created on write.
+def test_delete_key_with_invalid_chars_canonicalized():
+    cur = FakeCursor(rowcounts=[1])
+    target = _make_target(cur, schema_props=("account_id",))
+
+    deleted = target.delete_records("Accounts", [{"Account Id": "a1"}])
+
+    assert deleted == 1
+    assert cur.delete_params() == [["a1"]]
+
+
 # WHY: composite PKs must flatten params as (v1a, v2a, v1b, v2b, ...) matching
 #      the WHERE (col1, col2) IN (...) tuple ordering.
 def test_deletes_by_composite_pk():
     cur = FakeCursor(rowcounts=[1])
-    target = _make_target(cur, schema_props=("ID", "_sdc_division"))
+    target = _make_target(cur, schema_props=("id", "_sdc_division"))
 
     deleted = target.delete_records(
         "Journals", [{"ID": "g1", "_sdc_division": 100}]
@@ -114,7 +139,7 @@ def test_deletes_by_composite_pk():
 # WHY: large delete sets are split into DELETE_BATCH_SIZE-sized statements.
 def test_batches_deletes():
     cur = FakeCursor(rowcounts=[2, 2, 1])
-    target = _make_target(cur, schema_props=("ID",))
+    target = _make_target(cur, schema_props=("id",))
     target.DELETE_BATCH_SIZE = 2
 
     records = [{"ID": f"a{i}"} for i in range(5)]
@@ -152,7 +177,7 @@ def test_missing_table_is_skipped():
 # WHY: a PK column absent from the table -> skip + rollback, never raise.
 def test_missing_pk_column_is_skipped():
     cur = FakeCursor()
-    target = _make_target(cur, schema_props=("OTHER",))
+    target = _make_target(cur, schema_props=("other",))
 
     deleted = target.delete_records("Accounts", [{"ID": "x"}])
 
@@ -166,7 +191,7 @@ def test_missing_pk_column_is_skipped():
 #      delete bookmark past a deletion that never landed (data loss).
 def test_execute_failure_raises():
     cur = FakeCursor(raise_on_delete=True)  # generic, non-connection error
-    target = _make_target(cur, schema_props=("ID",))
+    target = _make_target(cur, schema_props=("id",))
     # A non-connection error must NOT trigger a reconnect.
     reconnects = {"n": 0}
     target._get_connection = lambda *a, **k: reconnects.__setitem__("n", reconnects["n"] + 1)
@@ -183,7 +208,7 @@ def test_execute_failure_raises():
 #      silent success.
 def test_connection_loss_retries_then_raises():
     cur0 = FakeCursor(raise_on_delete="connection already closed")
-    target = _make_target(cur0, schema_props=("ID",))
+    target = _make_target(cur0, schema_props=("id",))
 
     reconnects = {"n": 0}
 
@@ -205,7 +230,7 @@ def test_connection_loss_retries_then_raises():
 def test_connection_loss_then_recovers():
     cur0 = FakeCursor(raise_on_delete="connection already closed")
     good_cur = FakeCursor(rowcounts=[1])
-    target = _make_target(cur0, schema_props=("ID",))
+    target = _make_target(cur0, schema_props=("id",))
 
     reconnects = {"n": 0}
 

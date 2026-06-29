@@ -524,6 +524,9 @@ class PostgresTarget(SQLInterface):
         Used to propagate source-side deletions (Singer DELETERECORD messages) to
         the target. Each item in `records` is a dict of {pk_column: value, ...};
         all key/value pairs are matched, so composite primary keys are supported.
+        Keys are canonicalized to physical column names the same way the write
+        path canonicalizes columns, so source-cased keys (e.g. `ID`) match the
+        stored column (`id`).
 
         A delete that cannot be *applied* is best-effort and skipped (returns 0):
         a missing table, a primary-key column absent from the table, or a key that
@@ -570,15 +573,20 @@ class PostgresTarget(SQLInterface):
 
                         existing_columns = set(current_table_schema['schema']['properties'].keys())
 
-                        # Primary-key columns come from the records themselves (the tap maps
-                        # the source PK fields to target column names before emitting).
-                        pk_columns = list(records[0].keys())
+                        # Delete keys arrive as the source field names, but the write
+                        # path stores them under canonicalized physical column names
+                        # (lower-cased, invalid chars -> `_`; see canonicalize_identifier).
+                        # Canonicalize the delete keys the same way so e.g. a connector
+                        # emitting `ID` matches the physical `id` column instead of
+                        # silently no-op'ing (and then advancing the delete bookmark).
+                        raw_pk_columns = list(records[0].keys())
+                        pk_columns = [self.canonicalize_identifier(c) for c in raw_pk_columns]
                         missing = [c for c in pk_columns if c not in existing_columns]
                         if not pk_columns or missing:
                             self.LOGGER.warning(
-                                'delete_records: primary-key column(s) {} not found in '
-                                'table `{}`; skipping {} delete(s)'.format(
-                                    missing or pk_columns, root_table_name, len(records)
+                                'delete_records: primary-key column(s) {} (canonicalized '
+                                'from {}) not found in table `{}`; skipping {} delete(s)'.format(
+                                    missing or pk_columns, raw_pk_columns, root_table_name, len(records)
                                 )
                             )
                             self.conn.rollback()
@@ -603,7 +611,9 @@ class PostgresTarget(SQLInterface):
                             delete_stmt = sql.SQL(
                                 'DELETE FROM {table} WHERE ({columns}) IN ({rows})'
                             ).format(table=full_table, columns=columns_sql, rows=row_placeholders)
-                            params = [record[c] for record in batch for c in pk_columns]
+                            # WHERE columns use canonical names (pk_columns); the values
+                            # are read from each record by its raw (source) key.
+                            params = [record[c] for record in batch for c in raw_pk_columns]
                             cur.execute(delete_stmt, params)
                             deleted_total += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
