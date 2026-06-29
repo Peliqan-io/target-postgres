@@ -8,7 +8,8 @@ test_postgres.py covers end-to-end behavior).
 """
 import pytest
 
-from target_postgres.postgres import PostgresTarget
+from target_postgres.postgres import PostgresTarget, MAX_RETRY_COUNT
+from target_postgres.exceptions import PostgresError
 
 
 class FakeCursor:
@@ -31,7 +32,14 @@ class FakeCursor:
             return
         # Composed DELETE statement
         if self.raise_on_delete:
-            raise Exception("simulated execute failure")
+            # raise_on_delete may be a custom message (e.g. to simulate a
+            # transient 'connection already closed' error) or just True.
+            msg = (
+                self.raise_on_delete
+                if isinstance(self.raise_on_delete, str)
+                else "simulated execute failure"
+            )
+            raise Exception(msg)
         self.executed.append((stmt, params))
         self.rowcount = self._rowcounts.pop(0) if self._rowcounts else 0
 
@@ -44,6 +52,7 @@ class FakeConn:
         self._cur = cur
         self.committed = False
         self.rolled_back = False
+        self.closed = False
 
     def cursor(self):
         return self._cur
@@ -53,6 +62,9 @@ class FakeConn:
 
     def rollback(self):
         self.rolled_back = True
+
+    def close(self):
+        self.closed = True
 
 
 def _make_target(cur, schema_props=("ID",)):
@@ -149,13 +161,62 @@ def test_missing_pk_column_is_skipped():
     assert target.conn.rolled_back is True
 
 
-# WHY: a failure executing the DELETE is best-effort — rolled back, returns 0,
-#      and must NOT propagate (per the ticket: deletes never error the run).
-def test_execute_failure_is_swallowed():
-    cur = FakeCursor(raise_on_delete=True)
+# WHY: a real DELETE execution failure (not a deterministic skip) must be
+#      RAISED, not swallowed. Swallowing it would let the caller advance the
+#      delete bookmark past a deletion that never landed (data loss).
+def test_execute_failure_raises():
+    cur = FakeCursor(raise_on_delete=True)  # generic, non-connection error
     target = _make_target(cur, schema_props=("ID",))
+    # A non-connection error must NOT trigger a reconnect.
+    reconnects = {"n": 0}
+    target._get_connection = lambda *a, **k: reconnects.__setitem__("n", reconnects["n"] + 1)
+
+    with pytest.raises(PostgresError):
+        target.delete_records("Accounts", [{"ID": "x"}])
+
+    assert target.conn.rolled_back is True
+    assert reconnects["n"] == 0
+
+
+# WHY: a transient connection loss is retried (reconnect + replay) like
+#      write_batch, then RAISED once MAX_RETRY_COUNT is exhausted — never a
+#      silent success.
+def test_connection_loss_retries_then_raises():
+    cur0 = FakeCursor(raise_on_delete="connection already closed")
+    target = _make_target(cur0, schema_props=("ID",))
+
+    reconnects = {"n": 0}
+
+    def fake_get_connection(*a, **k):
+        reconnects["n"] += 1
+        # every reconnect also fails the same transient way
+        return FakeConn(FakeCursor(raise_on_delete="connection already closed"))
+
+    target._get_connection = fake_get_connection
+
+    with pytest.raises(PostgresError):
+        target.delete_records("Accounts", [{"ID": "x"}])
+
+    assert reconnects["n"] == MAX_RETRY_COUNT
+
+
+# WHY: a single transient connection loss recovers on reconnect and the delete
+#      still succeeds.
+def test_connection_loss_then_recovers():
+    cur0 = FakeCursor(raise_on_delete="connection already closed")
+    good_cur = FakeCursor(rowcounts=[1])
+    target = _make_target(cur0, schema_props=("ID",))
+
+    reconnects = {"n": 0}
+
+    def fake_get_connection(*a, **k):
+        reconnects["n"] += 1
+        return FakeConn(good_cur)
+
+    target._get_connection = fake_get_connection
 
     deleted = target.delete_records("Accounts", [{"ID": "x"}])
 
-    assert deleted == 0
-    assert target.conn.rolled_back is True
+    assert deleted == 1
+    assert reconnects["n"] == 1
+    assert good_cur.delete_params() == [["x"]]
