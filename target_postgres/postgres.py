@@ -124,6 +124,9 @@ class PostgresTarget(SQLInterface):
     # TODO: Figure out way to `SELECT` value from commands
     IDENTIFIER_FIELD_LENGTH = 63
 
+    ## Max number of DELETERECORD rows deleted per DELETE statement (per stream).
+    DELETE_BATCH_SIZE = 1000
+
     def __init__(self, config, *args,
         postgres_schema='public',
         logging_level=None,
@@ -514,6 +517,146 @@ class PostgresTarget(SQLInterface):
 
 
         raise PostgresError(f"Retry limit exceeded while writing batch to Postgres error={exception}. Exiting...")
+
+    def delete_records(self, stream_name, records):
+        """Delete rows from a stream's table by primary key.
+
+        Used to propagate source-side deletions (Singer DELETERECORD messages) to
+        the target. Each item in `records` is a dict of {pk_column: value, ...};
+        all key/value pairs are matched, so composite primary keys are supported.
+        Keys are canonicalized to physical column names the same way the write
+        path canonicalizes columns, so source-cased keys (e.g. `ID`) match the
+        stored column (`id`).
+
+        A delete that cannot be *applied* is best-effort and skipped (returns 0):
+        a missing table, a primary-key column absent from the table, or a key that
+        matches no rows -- the row may already be gone. Transient connection loss
+        is retried (reconnect + replay) up to MAX_RETRY_COUNT, mirroring
+        write_batch; any other execution failure, or exhausted retries, is raised
+        so the caller does not advance the delete bookmark past a deletion that was
+        never actually applied.
+
+        :param stream_name: the stream (table) to delete from
+        :param records: list of dicts mapping primary-key column name -> value
+        :return: number of rows deleted
+        """
+        if not records:
+            return 0
+
+        # Mirror write_batch's connection-retry loop: a transient connection loss
+        # is retried (reconnect + replay) up to MAX_RETRY_COUNT; any other failure
+        # is raised. A delete that simply cannot be applied (missing table/column,
+        # no matching rows) is still a best-effort skip (return 0) -- the row may
+        # already be gone -- but a real execution failure must never be swallowed,
+        # or the delete bookmark would advance past a deletion that never landed.
+        retry_counter = MAX_RETRY_COUNT
+        exception = None
+        while retry_counter >= 0:
+            try:
+                with self.conn.cursor() as cur:
+                    try:
+                        cur.execute('BEGIN;')
+
+                        self.setup_table_mapping_cache(cur)
+                        root_table_name = self.add_table_mapping_helper(
+                            (stream_name,), self.table_mapping_cache
+                        )['to']
+                        current_table_schema = self.get_table_schema(cur, root_table_name)
+
+                        if not current_table_schema:
+                            self.LOGGER.warning(
+                                'delete_records: table for stream `{}` does not exist; '
+                                'skipping {} delete(s)'.format(stream_name, len(records))
+                            )
+                            self.conn.rollback()
+                            return 0
+
+                        existing_columns = set(current_table_schema['schema']['properties'].keys())
+
+                        # Delete keys arrive as the source field names, but the write
+                        # path stores them under canonicalized physical column names
+                        # (lower-cased, invalid chars -> `_`; see canonicalize_identifier).
+                        # Canonicalize the delete keys the same way so e.g. a connector
+                        # emitting `ID` matches the physical `id` column instead of
+                        # silently no-op'ing (and then advancing the delete bookmark).
+                        raw_pk_columns = list(records[0].keys())
+                        pk_columns = [self.canonicalize_identifier(c) for c in raw_pk_columns]
+                        missing = [c for c in pk_columns if c not in existing_columns]
+                        if not pk_columns or missing:
+                            self.LOGGER.warning(
+                                'delete_records: primary-key column(s) {} (canonicalized '
+                                'from {}) not found in table `{}`; skipping {} delete(s)'.format(
+                                    missing or pk_columns, raw_pk_columns, root_table_name, len(records)
+                                )
+                            )
+                            self.conn.rollback()
+                            return 0
+
+                        full_table = sql.SQL('{}.{}').format(
+                            sql.Identifier(self.postgres_schema),
+                            sql.Identifier(root_table_name),
+                        )
+                        columns_sql = sql.SQL(', ').join(sql.Identifier(c) for c in pk_columns)
+
+                        # Batch the deletes: DELETE ... WHERE (pk1, pk2) IN ((..),(..),...)
+                        deleted_total = 0
+                        for start in range(0, len(records), self.DELETE_BATCH_SIZE):
+                            batch = records[start:start + self.DELETE_BATCH_SIZE]
+                            row_placeholders = sql.SQL(', ').join(
+                                sql.SQL('({})').format(
+                                    sql.SQL(', ').join(sql.Placeholder() for _ in pk_columns)
+                                )
+                                for _ in batch
+                            )
+                            delete_stmt = sql.SQL(
+                                'DELETE FROM {table} WHERE ({columns}) IN ({rows})'
+                            ).format(table=full_table, columns=columns_sql, rows=row_placeholders)
+                            # WHERE columns use canonical names (pk_columns); the values
+                            # are read from each record by its raw (source) key.
+                            params = [record[c] for record in batch for c in raw_pk_columns]
+                            cur.execute(delete_stmt, params)
+                            deleted_total += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+                        self.conn.commit()
+                        self.LOGGER.info(
+                            'delete_records: deleted {} row(s) from `{}` ({} delete(s) requested)'.format(
+                                deleted_total, root_table_name, len(records)
+                            )
+                        )
+                        return deleted_total
+                    except Exception as ex:
+                        # The DELETE itself failed (this is not a deterministic skip,
+                        # those return above). Roll back and re-raise so the retry
+                        # layer below can reconnect on transient loss or surface the
+                        # error -- a genuine failure must never be swallowed.
+                        message = 'Exception deleting records'
+                        self.LOGGER.exception(message)
+                        self.conn.rollback()
+                        raise PostgresError(message, ex)
+            except Exception as ex:
+                if (
+                        'connection already closed' not in str(ex) and
+                        'cursor already closed' not in str(ex) and
+                        'connection has been closed unexpectedly' not in str(ex)
+                ):
+                    raise
+
+                exception = ex
+                if retry_counter <= 0:
+                    break
+
+                self.LOGGER.warning('Connection error: {}. Attempting to reconnect'.format(ex))
+                try:
+                    # make sure old connection is actually closed
+                    self.conn.close()
+                except Exception:
+                    pass
+
+                self.conn = self._get_connection()
+                self.LOGGER.info('Re-processing delete batch Attempt({})'.format(MAX_RETRY_COUNT - retry_counter + 1))
+                retry_counter -= 1
+
+        raise PostgresError(f"Retry limit exceeded while deleting records from Postgres error={exception}. Exiting...")
 
     def activate_version(self, stream_buffer, version):
         with self.conn.cursor() as cur:
