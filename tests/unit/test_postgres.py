@@ -2112,3 +2112,84 @@ def test_before_run_sql_is_executed_upon_construction(db_cleanup):
 
             cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name='after_sql_test';")
             assert cur.fetchone()[0] == 'after_sql_test'
+
+
+def test_activate_version__empty_response_clears_table(db_cleanup):
+    # First run: 100 cats at version 1, forcing the nested immunizations table to
+    # be populated -> both root and nested tables exist with rows.
+    main(CONFIG, input_stream=CatStream(100, version=1, nested_count=3))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(get_count_sql('cats'))
+            assert cur.fetchone()[0] == 100
+            cur.execute(get_count_sql('cats__adoption__immunizations'))
+            assert cur.fetchone()[0] > 0
+
+    # Second run: empty response (0 records) but a NEWER ACTIVATE_VERSION.
+    # FULL_TABLE semantics: root AND nested tables must reflect the (empty) source.
+    # Before the fix, activate_version found no `cats__2` shadow tables and no-op'd,
+    # leaving the stale rows in place.
+    main(CONFIG, input_stream=CatStream(0, version=2))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(get_count_sql('cats'))
+            assert cur.fetchone()[0] == 0
+            cur.execute(get_count_sql('cats__adoption__immunizations'))
+            assert cur.fetchone()[0] == 0
+
+
+def test_activate_version__empty_response_clears_nested_and_truncated_tables(db_cleanup):
+    # NestedStream produces deeply-nested children, including one whose name
+    # exceeds PostgreSQL's 63-char limit and is truncated. This proves the empty
+    # path names its shadow clones through the SAME add_table_mapping helper
+    # write_batch uses (canonicalize + 63-char truncation): if the clone name were
+    # hand-built, the truncated child would not match and would NOT be cleared.
+    truncated_child = \
+        'root__object_of_object_0__object_of_object_1__object_of_object_2__array_scalar'[:63]
+
+    main(CONFIG, input_stream=NestedStream(10, version=1))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(get_count_sql('root'))
+            assert cur.fetchone()[0] == 10
+            cur.execute(get_count_sql('root__array_scalar'))
+            assert cur.fetchone()[0] == 50
+            cur.execute(get_count_sql(truncated_child))
+            assert cur.fetchone()[0] == 50
+
+    main(CONFIG, input_stream=NestedStream(0, version=2))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(get_count_sql('root'))
+            assert cur.fetchone()[0] == 0
+            cur.execute(get_count_sql('root__array_scalar'))
+            assert cur.fetchone()[0] == 0
+            cur.execute(get_count_sql(truncated_child))
+            assert cur.fetchone()[0] == 0
+
+
+def test_activate_version__nonempty_still_swaps(db_cleanup):
+    # Non-empty path must be unaffected: a newer version with records swaps in.
+    main(CONFIG, input_stream=CatStream(100, version=1))
+    main(CONFIG, input_stream=CatStream(50, version=2))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(get_count_sql('cats'))
+            assert cur.fetchone()[0] == 50
+
+
+def test_activate_version__first_sync_empty_leaves_table_absent(db_cleanup):
+    # First-ever sync is empty: there is no existing table to clone/swap.
+    # activate_version hits the "Table for stream does not exist" guard and does
+    # nothing -- the table is intentionally left absent (consistent with
+    # test_loading__empty). Codifies that edge so it can't silently change.
+    main(CONFIG, input_stream=CatStream(0, version=1))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL('''
+                SELECT EXISTS(
+                  SELECT 1 FROM information_schema.tables
+                  WHERE table_schema = {} AND table_name = {}
+                );
+            ''').format(sql.Literal('public'), sql.Literal('cats')))
+            assert not cur.fetchone()[0]
