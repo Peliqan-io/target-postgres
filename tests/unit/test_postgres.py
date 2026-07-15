@@ -2136,36 +2136,35 @@ def test_activate_version__empty_response_clears_table(db_cleanup):
             assert cur.fetchone()[0] == 0
             cur.execute(get_count_sql('cats__adoption__immunizations'))
             assert cur.fetchone()[0] == 0
+            # active version metadata advances to the empty run's version
+            cur.execute("SELECT obj_description('public.cats'::regclass)")
+            assert json.loads(cur.fetchone()[0])['version'] == 2
 
 
-def test_activate_version__empty_response_clears_nested_and_truncated_tables(db_cleanup):
-    # NestedStream produces deeply-nested children, including one whose name
-    # exceeds PostgreSQL's 63-char limit and is truncated. This proves the empty
-    # path names its shadow clones through the SAME add_table_mapping helper
-    # write_batch uses (canonicalize + 63-char truncation): if the clone name were
-    # hand-built, the truncated child would not match and would NOT be cleared.
-    truncated_child = \
-        'root__object_of_object_0__object_of_object_1__object_of_object_2__array_scalar'[:63]
+def test_activate_version__empty_response_rebuilds_from_current_schema(db_cleanup):
+    # The empty path rebuilds the shadow table from the CURRENT Singer schema via
+    # write_batch_helper -- it does NOT clone the old table. A column present only
+    # in the empty run's schema must therefore exist afterward.
+    main(CONFIG, input_stream=CatStream(100, version=1))
 
-    main(CONFIG, input_stream=NestedStream(10, version=1))
+    empty_stream = CatStream(0, version=2)
+    empty_stream.schema = deepcopy(empty_stream.schema)
+    empty_stream.schema['schema']['properties']['paw_toe_count'] = {'type': ['null', 'integer']}
+    main(CONFIG, input_stream=empty_stream)
+
     with psycopg2.connect(**TEST_DB) as conn:
         with conn.cursor() as cur:
-            cur.execute(get_count_sql('root'))
-            assert cur.fetchone()[0] == 10
-            cur.execute(get_count_sql('root__array_scalar'))
-            assert cur.fetchone()[0] == 50
-            cur.execute(get_count_sql(truncated_child))
-            assert cur.fetchone()[0] == 50
-
-    main(CONFIG, input_stream=NestedStream(0, version=2))
-    with psycopg2.connect(**TEST_DB) as conn:
-        with conn.cursor() as cur:
-            cur.execute(get_count_sql('root'))
+            cur.execute(get_count_sql('cats'))
             assert cur.fetchone()[0] == 0
-            cur.execute(get_count_sql('root__array_scalar'))
-            assert cur.fetchone()[0] == 0
-            cur.execute(get_count_sql(truncated_child))
-            assert cur.fetchone()[0] == 0
+            # new column exists -> table was built from the current schema, not cloned
+            cur.execute(sql.SQL('''
+                SELECT EXISTS(
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = {} AND table_name = {} AND column_name = {}
+                );
+            ''').format(sql.Literal('public'), sql.Literal('cats'),
+                        sql.Literal('paw_toe_count')))
+            assert cur.fetchone()[0]
 
 
 def test_activate_version__nonempty_still_swaps(db_cleanup):

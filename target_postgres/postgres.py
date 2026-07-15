@@ -547,41 +547,21 @@ class PostgresTarget(SQLInterface):
                     versioned_table_names = [row[0] for row in cur.fetchall()]
 
                     if not versioned_table_names:
-                        # Empty stream: the tap emitted ACTIVATE_VERSION for a newer
-                        # version but produced no records, so write_batch created no
-                        # `<root>__<version>` shadow tables and the swap loop below has
-                        # nothing to rename -- prior-run rows are left in place and
-                        # FULL_TABLE never clears on an empty response (e.g. Saltedge
-                        # transactions_pending). Create an empty clone of each of the
-                        # stream's live tables (root + nested) under the SAME versioned
-                        # name write_batch would have produced, then fall through to the
-                        # normal swap so the established rename/view/metadata handling
-                        # clears root and nested tables alike.
-                        #
-                        # Crucially the clone name is generated through add_table_mapping
-                        # -- the same canonicalize + 63-char truncation + collision
-                        # handling write_batch uses -- NOT a hand-rolled string, so the
-                        # shadow table matches what a non-empty response would create and
-                        # the swap loop reconstructs it identically (including for long /
-                        # truncated nested names).
-                        for path, live_table_name in list(self.table_mapping_cache.items()):
-                            if not path or path[0] != stream_buffer.stream:
-                                continue
-                            versioned_path = (versioned_root_table,) + path[1:]
-                            versioned_table_name = self.add_table_mapping(cur, versioned_path, {})
-                            cur.execute(sql.SQL(
-                                'CREATE TABLE {}.{} (LIKE {}.{} INCLUDING ALL);').format(
-                                sql.Identifier(self.postgres_schema),
-                                sql.Identifier(versioned_table_name),
-                                sql.Identifier(self.postgres_schema),
-                                sql.Identifier(live_table_name)))
-                            clone_metadata = self._get_table_metadata(cur, live_table_name) or {}
-                            clone_metadata['version'] = version
-                            self._set_table_metadata(cur, versioned_table_name, clone_metadata)
+                        # Empty stream: no `<root>__<version>` shadow tables were created
+                        # (write_batch skips empty batches), so the swap loop below has
+                        # nothing to rename and prior-run rows survive -- FULL_TABLE never
+                        # clears on an empty response (e.g. Saltedge transactions_pending).
+                        # Build the (empty) shadow tables -- root and nested -- from the
+                        # current schema via the same write_batch_helper the non-empty
+                        # path uses, then re-query and fall through to the normal swap.
+                        self.write_batch_helper(
+                            cur,
+                            versioned_root_table,
+                            stream_buffer.schema,
+                            stream_buffer.key_properties,
+                            [],
+                            {'version': version})
 
-                        # Re-fetch so the swap loop below picks up the freshly-created
-                        # (empty) shadow tables and swaps them in exactly as it does for
-                        # a non-empty response.
                         cur.execute(sql.SQL('''
                             SELECT tablename FROM pg_tables
                             WHERE schemaname = {} AND tablename like {};
