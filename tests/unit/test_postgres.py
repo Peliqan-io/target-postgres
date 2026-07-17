@@ -2192,3 +2192,36 @@ def test_activate_version__first_sync_empty_leaves_table_absent(db_cleanup):
                 );
             ''').format(sql.Literal('public'), sql.Literal('cats')))
             assert not cur.fetchone()[0]
+
+
+def test_activate_version__incremental_to_full_table_transition_preserves_data(db_cleanup):
+    # Regression guard for the empty-response clear.
+    #
+    # A stream first loaded via INCREMENTAL (records carry no version, so they land
+    # directly in the live table, leaving version metadata null), then switched to
+    # FULL_TABLE. The FULL_TABLE run carries DATA + a version, but because the live
+    # table has no active version, write_batch upserts those rows into the live
+    # table rather than a `cats__<version>` temp table -- so activate_version finds
+    # no versioned tables. It must NOT mistake that for an empty response and wipe
+    # the table: the freshly-loaded rows have to survive (behaves exactly like
+    # master for this version-less case; the empty-clear only applies to tables
+    # that already have an active version).
+
+    # 1) INCREMENTAL-style load: no version -> live table, version metadata null.
+    main(CONFIG, input_stream=CatStream(100))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(get_count_sql('cats'))
+            assert cur.fetchone()[0] == 100
+            cur.execute("SELECT obj_description('public.cats'::regclass)")
+            assert json.loads(cur.fetchone()[0]).get('version') is None
+
+    # 2) Switch to FULL_TABLE with data. The freshly-loaded records must survive
+    #    (before the fix, activate_version wiped the table -> 0 fresh rows).
+    main(CONFIG, input_stream=CatStream(50, version=1))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM cats WHERE _sdc_table_version = 1")
+            assert cur.fetchone()[0] == 50
+            cur.execute(get_count_sql('cats'))
+            assert cur.fetchone()[0] > 0  # table not wiped

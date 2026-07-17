@@ -546,14 +546,23 @@ class PostgresTarget(SQLInterface):
 
                     versioned_table_names = [row[0] for row in cur.fetchall()]
 
-                    if not versioned_table_names:
-                        # Empty stream: no `<root>__<version>` shadow tables were created
-                        # (write_batch skips empty batches), so the swap loop below has
-                        # nothing to rename and prior-run rows survive -- FULL_TABLE never
-                        # clears on an empty response (e.g. Saltedge transactions_pending).
-                        # Build the (empty) shadow tables -- root and nested -- from the
-                        # current schema via the same write_batch_helper the non-empty
-                        # path uses, then re-query and fall through to the normal swap.
+                    # No `<root>__<version>` temp tables were found. For a table that is
+                    # ALREADY versioned this can only mean the stream produced no records
+                    # this run -- a genuine empty response -- so build the (empty)
+                    # versioned temp tables from the current schema (root + nested) with
+                    # the same write_batch_helper the normal path uses, then re-query so
+                    # the swap loop below clears the live tables. This is the fix for
+                    # FULL_TABLE never clearing on an empty response (e.g. Saltedge
+                    # `transactions_pending`).
+                    #
+                    # We deliberately restrict this to tables that already have an active
+                    # version. If the table has NO version, the stream was previously
+                    # non-versioned (e.g. INCREMENTAL) and this run's records were written
+                    # straight into the live table -- so "no temp table" does NOT mean
+                    # "empty", and clearing would wipe freshly-loaded data. In that case
+                    # we do exactly what master did: nothing (the swap loop below iterates
+                    # over the empty list). Introduces no new behaviour for that path.
+                    if not versioned_table_names and current_table_schema.get('version') is not None:
                         self.write_batch_helper(
                             cur,
                             versioned_root_table,
