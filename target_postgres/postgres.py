@@ -687,7 +687,42 @@ class PostgresTarget(SQLInterface):
                         sql.Literal(self.postgres_schema),
                         sql.Literal(versioned_root_table + '%')))
 
-                    for versioned_table_name in map(lambda x: x[0], cur.fetchall()):
+                    versioned_table_names = [row[0] for row in cur.fetchall()]
+
+                    # No `<root>__<version>` temp tables were found. For a table that is
+                    # ALREADY versioned this can only mean the stream produced no records
+                    # this run -- a genuine empty response -- so build the (empty)
+                    # versioned temp tables from the current schema (root + nested) with
+                    # the same write_batch_helper the normal path uses, then re-query so
+                    # the swap loop below clears the live tables. This is the fix for
+                    # FULL_TABLE never clearing on an empty response (e.g. Saltedge
+                    # `transactions_pending`).
+                    #
+                    # We deliberately restrict this to tables that already have an active
+                    # version. If the table has NO version, the stream was previously
+                    # non-versioned (e.g. INCREMENTAL) and this run's records were written
+                    # straight into the live table -- so "no temp table" does NOT mean
+                    # "empty", and clearing would wipe freshly-loaded data. In that case
+                    # we do exactly what master did: nothing (the swap loop below iterates
+                    # over the empty list). Introduces no new behaviour for that path.
+                    if not versioned_table_names and current_table_schema.get('version') is not None:
+                        self.write_batch_helper(
+                            cur,
+                            versioned_root_table,
+                            stream_buffer.schema,
+                            stream_buffer.key_properties,
+                            [],
+                            {'version': version})
+
+                        cur.execute(sql.SQL('''
+                            SELECT tablename FROM pg_tables
+                            WHERE schemaname = {} AND tablename like {};
+                        ''').format(
+                            sql.Literal(self.postgres_schema),
+                            sql.Literal(versioned_root_table + '%')))
+                        versioned_table_names = [row[0] for row in cur.fetchall()]
+
+                    for versioned_table_name in versioned_table_names:
                         table_name = root_table_name + versioned_table_name[len(versioned_root_table):]
 
                         table_path = names_to_paths[table_name]

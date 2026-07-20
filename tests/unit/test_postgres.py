@@ -2112,3 +2112,116 @@ def test_before_run_sql_is_executed_upon_construction(db_cleanup):
 
             cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_name='after_sql_test';")
             assert cur.fetchone()[0] == 'after_sql_test'
+
+
+def test_activate_version__empty_response_clears_table(db_cleanup):
+    # First run: 100 cats at version 1, forcing the nested immunizations table to
+    # be populated -> both root and nested tables exist with rows.
+    main(CONFIG, input_stream=CatStream(100, version=1, nested_count=3))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(get_count_sql('cats'))
+            assert cur.fetchone()[0] == 100
+            cur.execute(get_count_sql('cats__adoption__immunizations'))
+            assert cur.fetchone()[0] > 0
+
+    # Second run: empty response (0 records) but a NEWER ACTIVATE_VERSION.
+    # FULL_TABLE semantics: root AND nested tables must reflect the (empty) source.
+    # Before the fix, activate_version found no `cats__2` shadow tables and no-op'd,
+    # leaving the stale rows in place.
+    main(CONFIG, input_stream=CatStream(0, version=2))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(get_count_sql('cats'))
+            assert cur.fetchone()[0] == 0
+            cur.execute(get_count_sql('cats__adoption__immunizations'))
+            assert cur.fetchone()[0] == 0
+            # active version metadata advances to the empty run's version
+            cur.execute("SELECT obj_description('public.cats'::regclass)")
+            assert json.loads(cur.fetchone()[0])['version'] == 2
+
+
+def test_activate_version__empty_response_rebuilds_from_current_schema(db_cleanup):
+    # The empty path rebuilds the shadow table from the CURRENT Singer schema via
+    # write_batch_helper -- it does NOT clone the old table. A column present only
+    # in the empty run's schema must therefore exist afterward.
+    main(CONFIG, input_stream=CatStream(100, version=1))
+
+    empty_stream = CatStream(0, version=2)
+    empty_stream.schema = deepcopy(empty_stream.schema)
+    empty_stream.schema['schema']['properties']['paw_toe_count'] = {'type': ['null', 'integer']}
+    main(CONFIG, input_stream=empty_stream)
+
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(get_count_sql('cats'))
+            assert cur.fetchone()[0] == 0
+            # new column exists -> table was built from the current schema, not cloned
+            cur.execute(sql.SQL('''
+                SELECT EXISTS(
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = {} AND table_name = {} AND column_name = {}
+                );
+            ''').format(sql.Literal('public'), sql.Literal('cats'),
+                        sql.Literal('paw_toe_count')))
+            assert cur.fetchone()[0]
+
+
+def test_activate_version__nonempty_still_swaps(db_cleanup):
+    # Non-empty path must be unaffected: a newer version with records swaps in.
+    main(CONFIG, input_stream=CatStream(100, version=1))
+    main(CONFIG, input_stream=CatStream(50, version=2))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(get_count_sql('cats'))
+            assert cur.fetchone()[0] == 50
+
+
+def test_activate_version__first_sync_empty_leaves_table_absent(db_cleanup):
+    # First-ever sync is empty: there is no existing table to clone/swap.
+    # activate_version hits the "Table for stream does not exist" guard and does
+    # nothing -- the table is intentionally left absent (consistent with
+    # test_loading__empty). Codifies that edge so it can't silently change.
+    main(CONFIG, input_stream=CatStream(0, version=1))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql.SQL('''
+                SELECT EXISTS(
+                  SELECT 1 FROM information_schema.tables
+                  WHERE table_schema = {} AND table_name = {}
+                );
+            ''').format(sql.Literal('public'), sql.Literal('cats')))
+            assert not cur.fetchone()[0]
+
+
+def test_activate_version__incremental_to_full_table_transition_preserves_data(db_cleanup):
+    # Regression guard for the empty-response clear.
+    #
+    # A stream first loaded via INCREMENTAL (records carry no version, so they land
+    # directly in the live table, leaving version metadata null), then switched to
+    # FULL_TABLE. The FULL_TABLE run carries DATA + a version, but because the live
+    # table has no active version, write_batch upserts those rows into the live
+    # table rather than a `cats__<version>` temp table -- so activate_version finds
+    # no versioned tables. It must NOT mistake that for an empty response and wipe
+    # the table: the freshly-loaded rows have to survive (behaves exactly like
+    # master for this version-less case; the empty-clear only applies to tables
+    # that already have an active version).
+
+    # 1) INCREMENTAL-style load: no version -> live table, version metadata null.
+    main(CONFIG, input_stream=CatStream(100))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(get_count_sql('cats'))
+            assert cur.fetchone()[0] == 100
+            cur.execute("SELECT obj_description('public.cats'::regclass)")
+            assert json.loads(cur.fetchone()[0]).get('version') is None
+
+    # 2) Switch to FULL_TABLE with data. The freshly-loaded records must survive
+    #    (before the fix, activate_version wiped the table -> 0 fresh rows).
+    main(CONFIG, input_stream=CatStream(50, version=1))
+    with psycopg2.connect(**TEST_DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM cats WHERE _sdc_table_version = 1")
+            assert cur.fetchone()[0] == 50
+            cur.execute(get_count_sql('cats'))
+            assert cur.fetchone()[0] > 0  # table not wiped
