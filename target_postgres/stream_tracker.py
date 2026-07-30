@@ -1,9 +1,14 @@
 from collections import deque
 import json
+import singer
 import singer.statediff as statediff
 import sys
 
 from target_postgres.exceptions import TargetError
+
+LOGGER = singer.get_logger(is_target=True)
+
+DEFAULT_DELETE_BATCH_SIZE = 1000
 
 
 class StreamTracker:
@@ -33,18 +38,35 @@ class StreamTracker:
         self.message_counter = 0
         self.last_emitted_state = None
 
+        # dict of {'<stream_name>': [pk_record, ...]} buffering DELETERECORD messages
+        # until they are flushed to the target. A stream may appear here without a
+        # corresponding BufferedSingerStream, since a delete can target a table that
+        # was not (re)synced in this run (e.g. a dedicated delete-sync run).
+        self.delete_buffers = {}
+
     def register_stream(self, stream, buffered_stream):
         self.streams[stream] = buffered_stream
         self.stream_flush_watermarks[stream] = 0
 
     def flush_stream(self, stream):
-        self._write_batch_and_update_watermarks(stream)
+        if stream in self.streams:
+            self._write_batch_and_update_watermarks(stream)
+        # Flush deletes after records so an upsert + delete of the same PK in the
+        # same run ends up deleted.
+        if stream in self.delete_buffers:
+            self._flush_deletes(stream)
         self._emit_safe_queued_states()
 
     def flush_streams(self, force=False):
         for (stream, stream_buffer) in self.streams.items():
             if force or stream_buffer.buffer_full:
                 self._write_batch_and_update_watermarks(stream)
+
+        # Flush delete buffers after record batches (same ordering rationale as above).
+        delete_batch_size = getattr(self.target, 'DELETE_BATCH_SIZE', DEFAULT_DELETE_BATCH_SIZE)
+        for stream in list(self.delete_buffers.keys()):
+            if force or len(self.delete_buffers[stream]) >= delete_batch_size:
+                self._flush_deletes(stream)
 
         self._emit_safe_queued_states(force=force)
 
@@ -70,6 +92,21 @@ class StreamTracker:
         self.stream_add_watermarks[stream] = self.message_counter
         self.streams[stream].add_record_message(line_data)
 
+    def handle_delete_record_message(self, stream, record):
+        """Buffer a DELETERECORD's primary-key map for later deletion in the target.
+
+        Unlike RECORD messages, a DELETERECORD does not require a prior SCHEMA: a
+        delete can target a table that was not (re)synced in this run. The buffered
+        deletes are flushed (and STATE held back) using the same watermark logic as
+        record batches.
+        """
+        self.message_counter += 1
+        self.streams_added_to.add(stream)
+        self.stream_add_watermarks[stream] = self.message_counter
+        if stream not in self.stream_flush_watermarks:
+            self.stream_flush_watermarks[stream] = 0
+        self.delete_buffers.setdefault(stream, []).append(record)
+
     def _write_batch_and_update_watermarks(self, stream):
         stream_buffer = self.streams[stream]
         if len(stream_buffer.stream) >= self.target.IDENTIFIER_FIELD_LENGTH:
@@ -79,6 +116,20 @@ class StreamTracker:
         self.target.write_batch(stream_buffer)
         stream_buffer.flush_buffer()
         self.stream_flush_watermarks[stream] = self.stream_add_watermarks.get(stream, 0)
+
+    def _flush_deletes(self, stream):
+        records = self.delete_buffers.pop(stream, [])
+        if records:
+            if hasattr(self.target, 'delete_records'):
+                self.target.delete_records(stream, records)
+            else:
+                LOGGER.warning(
+                    "Target does not implement delete_records; "
+                    "skipping {} delete(s) for stream {}".format(len(records), stream)
+                )
+        self.stream_flush_watermarks[stream] = self.stream_add_watermarks.get(
+            stream, self.stream_flush_watermarks.get(stream, 0)
+        )
 
     def _emit_safe_queued_states(self, force=False):
         # State messages that occured before the least recently flushed record are safe to emit.

@@ -140,6 +140,15 @@ def _line_handler(state_tracker, target, invalid_records_detect, invalid_records
 
         line_data[RAW_LINE_SIZE] = len(line)
         state_tracker.handle_record_message(line_data['stream'], line_data)
+    elif line_data['type'] == 'DELETERECORD':
+        # Source-side deletion: delete the row(s) matching the primary-key map in
+        # `record`. Unlike RECORD, no prior SCHEMA is required (a delete can target
+        # a table that was not (re)synced this run).
+        if 'stream' not in line_data:
+            raise TargetError('`stream` is a required key: {}'.format(line))
+        if 'record' not in line_data:
+            raise TargetError('`record` is a required key: {}'.format(line))
+        state_tracker.handle_delete_record_message(line_data['stream'], line_data['record'])
     elif line_data['type'] == 'ACTIVATE_VERSION':
         if 'stream' not in line_data:
             raise TargetError('`stream` is a required key: {}'.format(line))
