@@ -178,7 +178,11 @@ def test_state__capture_can_be_disabled(capsys):
     assert len(output) == 0
 
 
-def test_state__emits_only_messages_when_all_records_before_have_been_flushed(capsys):
+def test_state__emits_each_state_immediately_as_a_checkpoint(capsys):
+    # Each STATE is a checkpoint: the records before it are flushed and the
+    # bookmark is emitted right away, rather than being held back until a later
+    # batch boundary. (Previously this verified the opposite, "hold-back",
+    # behaviour; flushing on STATE is what makes per-table bookmarks durable.)
     config = CONFIG.copy()
     config['max_batch_rows'] = 20
     config['batch_detection_threshold'] = 1
@@ -190,37 +194,24 @@ def test_state__emits_only_messages_when_all_records_before_have_been_flushed(ca
         for row in rows[slice(1, 5)]:
             yield row
         yield json.dumps({'type': 'STATE', 'value': {'test': 'state-1'}})
+        # The records before state-1 were flushed and state-1 emitted immediately.
+        assert len(target.calls['write_batch']) >= 1
+        output = filtered_output(capsys)
+        assert len(output) == 1
+        assert json.loads(output[0])['test'] == 'state-1'
+
         for row in rows[slice(6, 10)]:
             yield row
         yield json.dumps({'type': 'STATE', 'value': {'test': 'state-2'}})
-        for row in rows[slice(11, 15)]:
-            yield row
-        yield json.dumps({'type': 'STATE', 'value': {'test': 'state-3'}})
-
-        # After some state messages but before the batch size has been hit no state messages should have been emitted
-        assert len(target.calls['write_batch']) == 0
-        output = filtered_output(capsys)
-        assert output == []
-
-        for row in rows[slice(16, 25)]:
-            yield row
-        yield json.dumps({'type': 'STATE', 'value': {'test': 'state-4'}})
-
-        # After the batch size has been hit and a write_batch call was made, the most recent safe to emit state should have been emitted
-        assert len(target.calls['write_batch']) == 1
         output = filtered_output(capsys)
         assert len(output) == 1
-        assert json.loads(output[0])['test'] == 'state-3'
-
-        for row in rows[slice(26, 31)]:
-            yield row
+        assert json.loads(output[0])['test'] == 'state-2'
 
     target_tools.stream_to_target(test_stream(), target, config=config)
 
-    # The final state message should have been outputted after the last records were loaded
+    # state-2 was already emitted on its STATE line; the final flush dedupes it.
     output = filtered_output(capsys)
-    assert len(output) == 1
-    assert json.loads(output[0])['test'] == 'state-4'
+    assert output == []
 
 
 def test_state__emits_most_recent_state_when_final_flush_occurs(capsys):
@@ -239,7 +230,9 @@ def test_state__emits_most_recent_state_when_final_flush_occurs(capsys):
     assert json.loads(output[0])['test'] == 'state-1'
 
 
-def test_state__doesnt_emit_when_only_one_of_several_streams_is_flushing(capsys):
+def test_state__flushes_all_streams_and_emits_on_each_state(capsys):
+    # With two streams holding buffered records, a STATE checkpoint flushes BOTH
+    # (force) and emits the bookmark immediately.
     config = CONFIG.copy()
     config['max_batch_rows'] = 20
     config['batch_detection_threshold'] = 1
@@ -247,8 +240,6 @@ def test_state__doesnt_emit_when_only_one_of_several_streams_is_flushing(capsys)
     dog_rows = list(DogStream(50))
     target = Target()
 
-    # Simulate one stream that yields a lot of records with another that yields few records and ensure both need to be flushed
-    # before any state messages are emitted
     def test_stream():
         yield cat_rows[0]
         yield dog_rows[0]
@@ -257,39 +248,26 @@ def test_state__doesnt_emit_when_only_one_of_several_streams_is_flushing(capsys)
         for row in dog_rows[slice(1, 5)]:
             yield row
         yield json.dumps({'type': 'STATE', 'value': {'test': 'state-1'}})
+        output = filtered_output(capsys)
+        assert len(output) == 1
+        assert json.loads(output[0])['test'] == 'state-1'
 
-        for row in cat_rows[slice(6, 45)]:
+        for row in cat_rows[slice(6, 10)]:
             yield row
         yield json.dumps({'type': 'STATE', 'value': {'test': 'state-2'}})
-
-        for row in cat_rows[slice(46, 65)]:
-            yield row
-        yield json.dumps({'type': 'STATE', 'value': {'test': 'state-3'}})
-
-        # After some state messages but before the batch size has been hit for both streams no state messages should have been emitted
-        assert len(target.calls['write_batch']) == 3
-        output = filtered_output(capsys)
-        assert output == []
-
-        for row in dog_rows[slice(6, 25)]:
-            yield row
-        yield json.dumps({'type': 'STATE', 'value': {'test': 'state-4'}})
-
-        # After the batch size has been hit and a write_batch call was made, the most recent safe to emit state should have been emitted
-        assert len(target.calls['write_batch']) == 4
         output = filtered_output(capsys)
         assert len(output) == 1
         assert json.loads(output[0])['test'] == 'state-2'
 
     target_tools.stream_to_target(test_stream(), target, config=config)
 
-    # The final state message should have been outputted after the last dog records were loaded despite not reaching one full flushable batch
     output = filtered_output(capsys)
-    assert len(output) == 1
-    assert json.loads(output[0])['test'] == 'state-4'
+    assert output == []
 
 
-def test_state__emits_when_multiple_streams_are_registered_but_records_arrive_from_only_one(capsys):
+def test_state__emits_when_records_arrive_from_only_one_of_several_streams(capsys):
+    # dog is registered (SCHEMA) but never produces records; a STATE checkpoint
+    # still flushes cat and emits the bookmark immediately.
     config = CONFIG.copy()
     config['max_batch_rows'] = 20
     config['batch_detection_threshold'] = 1
@@ -297,32 +275,53 @@ def test_state__emits_when_multiple_streams_are_registered_but_records_arrive_fr
     dog_rows = list(DogStream(50))
     target = Target()
 
-    # Simulate one stream that yields a lot of records with another that yields no records, and ensure that only the first
-    # needs to be flushed before any state messages are emitted
     def test_stream():
         yield cat_rows[0]
         yield dog_rows[0]
         for row in cat_rows[slice(1, 5)]:
             yield row
         yield json.dumps({'type': 'STATE', 'value': {'test': 'state-1'}})
-
-        for row in cat_rows[slice(6, 25)]:
-            yield row
-        yield json.dumps({'type': 'STATE', 'value': {'test': 'state-2'}})
-
-        # After some state messages and only one of the registered streams has hit the batch size, the state message should be emitted, as there are no unflushed records from the other stream yet
-        assert len(target.calls['write_batch']) == 1
         output = filtered_output(capsys)
         assert len(output) == 1
         assert json.loads(output[0])['test'] == 'state-1'
 
+        for row in cat_rows[slice(6, 25)]:
+            yield row
+        yield json.dumps({'type': 'STATE', 'value': {'test': 'state-2'}})
+        output = filtered_output(capsys)
+        assert len(output) == 1
+        assert json.loads(output[0])['test'] == 'state-2'
 
     target_tools.stream_to_target(test_stream(), target, config=config)
 
-    # The final state message should have been outputted after the last dog records were loaded despite not reaching one full flushable batch
     output = filtered_output(capsys)
-    assert len(output) == 1
-    assert json.loads(output[0])['test'] == 'state-2'
+    assert output == []
+
+
+def test_state__checkpoint_flushes_records_before_emitting(capsys):
+    # The records preceding a STATE must be flushed (durable) before the bookmark
+    # is emitted, even when no batch boundary has been hit yet -- so a consumer
+    # can never persist a bookmark that is ahead of the written data.
+    config = CONFIG.copy()
+    config['max_batch_rows'] = 1000
+    config['batch_detection_threshold'] = 1000
+    rows = list(CatStream(10))
+    target = Target()
+
+    def test_stream():
+        yield rows[0]
+        for row in rows[slice(1, 6)]:
+            yield row
+        # No batch boundary / buffer-full reached yet -> nothing flushed.
+        assert len(target.calls['write_batch']) == 0
+        yield json.dumps({'type': 'STATE', 'value': {'test': 'state-1'}})
+        # The STATE forced a flush, then emitted the bookmark.
+        assert len(target.calls['write_batch']) >= 1
+        output = filtered_output(capsys)
+        assert len(output) == 1
+        assert json.loads(output[0])['test'] == 'state-1'
+
+    target_tools.stream_to_target(test_stream(), target, config=config)
 
 
 def test_state__doesnt_emit_when_it_isnt_different_than_the_previous_emission(capsys):
