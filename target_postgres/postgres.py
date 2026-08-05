@@ -400,7 +400,17 @@ class PostgresTarget(SQLInterface):
         for mapped_name, raw_json in cur.fetchall():
             table_path = None
             if raw_json:
-                table_path = json.loads(raw_json).get('path', None)
+                # The comment on a co-existing table in the same schema is not
+                # guaranteed to be our JSON metadata -- a user may comment their
+                # own tables, or a managed DW may hold foreign tables. A non-JSON
+                # (or non-object) comment must be skipped, not raise, or it would
+                # break discovery and every load into this schema.
+                try:
+                    metadata = json.loads(raw_json)
+                except (ValueError, TypeError):
+                    metadata = None
+                if isinstance(metadata, dict):
+                    table_path = metadata.get('path', None)
             self.LOGGER.info("Mapping: {} to {}".format(mapped_name, table_path))
             if table_path:
                 self.table_mapping_cache[tuple(table_path)] = mapped_name
@@ -699,10 +709,18 @@ class PostgresTarget(SQLInterface):
                     # crashing in _get_table_metadata(). Pairing by path never slices a
                     # physical name and only ever touches this run's staging tables.
                     #
-                    # NB: match on the UNtruncated versioned_root -- that is the path
-                    # element write_batch() recorded (see postgres.py write_batch()); the
-                    # physical name may be truncated but the path key is not.
-                    versioned_root_table = TEMP_TABLE_MARKER + root_table_name + SEPARATOR + str(version)
+                    # NB: build the match key from the RAW stream name, NOT the
+                    # canonicalized root_table_name. write_batch() records the staging
+                    # path from stream_buffer.stream verbatim (path element
+                    # `pqtemp__<stream>__<version>`), and the live tables record their
+                    # path from the same raw stream name. root_table_name is the
+                    # canonicalized *physical* name (e.g. `C@ts` -> `c_ts`); using it
+                    # here would miss the staging tables for any stream whose name is
+                    # not already canonical (uppercase / special chars) -> silent
+                    # no-swap (stale live data). The physical name may also be
+                    # truncated, but the path key is the full untruncated tuple.
+                    raw_root = stream_buffer.stream
+                    versioned_root_table = TEMP_TABLE_MARKER + raw_root + SEPARATOR + str(version)
 
                     def collect_staging_paths():
                         return [
@@ -747,7 +765,13 @@ class PostgresTarget(SQLInterface):
                         # nested array new on this version) has no cache entry, so we
                         # register its name and rename onto it directly -- there is no
                         # old live table to swap out or drop.
-                        table_path = (root_table_name,) + staging_path[1:]
+                        #
+                        # The live path is keyed on the RAW stream name (raw_root), the
+                        # same way write_batch() recorded both the live and staging
+                        # paths -- not the canonicalized root_table_name -- so streams
+                        # with non-canonical names (uppercase / special chars) still
+                        # pair to their live table instead of missing it.
+                        table_path = (raw_root,) + staging_path[1:]
                         table_name = self.table_mapping_cache.get(table_path)
                         live_exists = table_name is not None
                         if not live_exists:
