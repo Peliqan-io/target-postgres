@@ -679,40 +679,55 @@ class PostgresTarget(SQLInterface):
                         stream_buffer.stream,
                         version))
                 else:
-                    # Must mirror the staging name built in write_batch() so the LIKE lookup
-                    # below finds the marked version table; the marker is stripped off when
-                    # computing the clean target table_name (table_name = root_table_name + ...).
+                    # EXACT-SET SWAP
+                    # --------------
+                    # write_batch() created the staging tables under table_mapping_cache
+                    # paths of the form (versioned_root, *subpath), where
+                    #   versioned_root = pqtemp__<stream>__<version>   (untruncated)
+                    # and the live tables they replace live under the paths
+                    #   (root_table_name, *subpath).
+                    # The cache maps every such path to its REAL physical name --
+                    # truncation and the `__1/__2` collision suffix already applied -- so
+                    # we can pair staging -> live exactly by path.
+                    #
+                    # This replaces the previous `SELECT ... WHERE tablename LIKE
+                    # '<versioned_root[:63]>%'` scan. That scan truncated the search
+                    # prefix to 63 chars, so for a long stream name it could (a) match
+                    # orphaned/collided staging tables left by an earlier run and (b)
+                    # rebuild the live name by slicing the physical string
+                    # (root_table_name + tail), yielding a name that does not exist and
+                    # crashing in _get_table_metadata(). Pairing by path never slices a
+                    # physical name and only ever touches this run's staging tables.
+                    #
+                    # NB: match on the UNtruncated versioned_root -- that is the path
+                    # element write_batch() recorded (see postgres.py write_batch()); the
+                    # physical name may be truncated but the path key is not.
                     versioned_root_table = TEMP_TABLE_MARKER + root_table_name + SEPARATOR + str(version)
-                    versioned_root_table = versioned_root_table[:self.IDENTIFIER_FIELD_LENGTH]
 
-                    names_to_paths = dict([(v, k) for k, v in self.table_mapping_cache.items()])
+                    def collect_staging_paths():
+                        return [
+                            path for path in self.table_mapping_cache
+                            if path and path[0] == versioned_root_table
+                        ]
 
-                    cur.execute(sql.SQL('''
-                        SELECT tablename FROM pg_tables
-                        WHERE schemaname = {} AND tablename like {};
-                    ''').format(
-                        sql.Literal(self.postgres_schema),
-                        sql.Literal(versioned_root_table + '%')))
+                    staging_paths = collect_staging_paths()
 
-                    versioned_table_names = [row[0] for row in cur.fetchall()]
-
-                    # No `<root>__<version>` temp tables were found. For a table that is
-                    # ALREADY versioned this can only mean the stream produced no records
-                    # this run -- a genuine empty response -- so build the (empty)
-                    # versioned temp tables from the current schema (root + nested) with
-                    # the same write_batch_helper the normal path uses, then re-query so
-                    # the swap loop below clears the live tables. This is the fix for
-                    # FULL_TABLE never clearing on an empty response (e.g. Saltedge
+                    # No staging tables for this version. For a table that is ALREADY
+                    # versioned this means the stream produced no records this run -- a
+                    # genuine empty response -- so build the (empty) versioned staging
+                    # tables from the current schema (root + nested) with the same
+                    # write_batch_helper the normal path uses, then re-collect them so
+                    # the swap loop below still clears the live tables. This is the fix
+                    # for FULL_TABLE never clearing on an empty response (e.g. Saltedge
                     # `transactions_pending`).
                     #
-                    # We deliberately restrict this to tables that already have an active
-                    # version. If the table has NO version, the stream was previously
-                    # non-versioned (e.g. INCREMENTAL) and this run's records were written
-                    # straight into the live table -- so "no temp table" does NOT mean
-                    # "empty", and clearing would wipe freshly-loaded data. In that case
-                    # we do exactly what master did: nothing (the swap loop below iterates
-                    # over the empty list). Introduces no new behaviour for that path.
-                    if not versioned_table_names and current_table_schema.get('version') is not None:
+                    # Restricted to tables that already have an active version: if the
+                    # table has NO version the stream was previously non-versioned (e.g.
+                    # INCREMENTAL) and this run's records went straight into the live
+                    # table -- so "no staging table" does NOT mean "empty", and clearing
+                    # would wipe freshly-loaded data. There we do nothing (the loop
+                    # iterates an empty list), exactly as before.
+                    if not staging_paths and current_table_schema.get('version') is not None:
                         self.write_batch_helper(
                             cur,
                             versioned_root_table,
@@ -720,19 +735,24 @@ class PostgresTarget(SQLInterface):
                             stream_buffer.key_properties,
                             [],
                             {'version': version})
+                        staging_paths = collect_staging_paths()
 
-                        cur.execute(sql.SQL('''
-                            SELECT tablename FROM pg_tables
-                            WHERE schemaname = {} AND tablename like {};
-                        ''').format(
-                            sql.Literal(self.postgres_schema),
-                            sql.Literal(versioned_root_table + '%')))
-                        versioned_table_names = [row[0] for row in cur.fetchall()]
+                    for staging_path in staging_paths:
+                        versioned_table_name = self.table_mapping_cache[staging_path]
 
-                    for versioned_table_name in versioned_table_names:
-                        table_name = root_table_name + versioned_table_name[len(versioned_root_table):]
+                        # Pair staging -> live by PATH (swap the versioned root back to
+                        # the clean root); never reconstruct the live name by slicing
+                        # the physical string. The live name is read straight from the
+                        # cache. A staging subtable with no live counterpart yet (a
+                        # nested array new on this version) has no cache entry, so we
+                        # register its name and rename onto it directly -- there is no
+                        # old live table to swap out or drop.
+                        table_path = (root_table_name,) + staging_path[1:]
+                        table_name = self.table_mapping_cache.get(table_path)
+                        live_exists = table_name is not None
+                        if not live_exists:
+                            table_name = self.add_table_mapping(cur, table_path, {})
 
-                        table_path = names_to_paths[table_name]
                         old_table_name = table_name + SEPARATOR + 'old'
                         if len(old_table_name) > self.IDENTIFIER_FIELD_LENGTH:
                             unique_suffix = self.canonicalize_identifier(str(uuid.uuid4()) + SEPARATOR + 'old')
@@ -765,15 +785,26 @@ class PostgresTarget(SQLInterface):
                                 view_name=sql.Identifier(view_name),
                             ))
 
-                        cur.execute(sql.SQL('''
-                                            ALTER TABLE {table_schema}.{stream_table} RENAME TO {stream_table_old};
-                                            ALTER TABLE {table_schema}.{version_table} RENAME TO {stream_table};
-                                            DROP TABLE {table_schema}.{stream_table_old};
-                                            ''').format(
-                            table_schema=sql.Identifier(self.postgres_schema),
-                            stream_table_old=sql.Identifier(old_table_name),
-                            stream_table=sql.Identifier(table_name),
-                            version_table=sql.Identifier(versioned_table_name)))
+                        if live_exists:
+                            # Atomic 3-step swap: live -> old, staging -> live, drop old.
+                            cur.execute(sql.SQL('''
+                                                ALTER TABLE {table_schema}.{stream_table} RENAME TO {stream_table_old};
+                                                ALTER TABLE {table_schema}.{version_table} RENAME TO {stream_table};
+                                                DROP TABLE {table_schema}.{stream_table_old};
+                                                ''').format(
+                                table_schema=sql.Identifier(self.postgres_schema),
+                                stream_table_old=sql.Identifier(old_table_name),
+                                stream_table=sql.Identifier(table_name),
+                                version_table=sql.Identifier(versioned_table_name)))
+                        else:
+                            # Brand-new subtable: no live table to swap out, just
+                            # promote the staging table to the clean name.
+                            cur.execute(sql.SQL('''
+                                                ALTER TABLE {table_schema}.{version_table} RENAME TO {stream_table};
+                                                ''').format(
+                                table_schema=sql.Identifier(self.postgres_schema),
+                                stream_table=sql.Identifier(table_name),
+                                version_table=sql.Identifier(versioned_table_name)))
                         
                         self.conn.commit()
 
