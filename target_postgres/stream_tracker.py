@@ -73,7 +73,15 @@ class StreamTracker:
     def handle_state_message(self, line):
         if self.emit_states:
             self.state_queue.append({'state': line, 'watermark': self.message_counter})
-            self._emit_safe_queued_states()
+            # Treat each STATE as a checkpoint: flush all buffered records so the
+            # data behind this bookmark is durable, then emit the bookmark now
+            # instead of holding it back behind later streams' watermarks. This
+            # lets a downstream consumer persist a per-table bookmark mid-run (so a
+            # hard-killed run can resume from the last completed table) without
+            # changing what data is ultimately written. flush_streams(force=True)
+            # ends by calling _emit_safe_queued_states(force=True), which emits the
+            # latest queued state.
+            self.flush_streams(force=True)
 
     def handle_record_message(self, stream, line_data):
         if stream not in self.streams:
