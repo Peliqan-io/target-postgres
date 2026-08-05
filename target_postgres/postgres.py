@@ -177,7 +177,10 @@ class PostgresTarget(SQLInterface):
                 except:
                     pass
 
-            if metadata and metadata.get('schema_version', 0) == 0:
+            # A co-existing table's comment may be valid JSON but not our object
+            # (e.g. a JSON array / scalar, or a user comment). Guard the .get so
+            # discovery/migration never crashes on a foreign comment.
+            if isinstance(metadata, dict) and metadata.get('schema_version', 0) == 0:
                 self.LOGGER.info('Migrating `{}` from schema_version 0 to 1'.format(mapped_name))
 
                 table_schema = self.__get_table_schema(cur, mapped_name)
@@ -267,7 +270,9 @@ class PostgresTarget(SQLInterface):
                 except:
                     pass
 
-            if metadata and metadata.get('schema_version', 0) == 1 and metadata.get('table_mappings'):
+            # Guard against a foreign / non-object comment (e.g. a JSON array or a
+            # user's plain-text comment) on a co-existing table in the same schema.
+            if isinstance(metadata, dict) and metadata.get('schema_version', 0) == 1 and metadata.get('table_mappings'):
                 self.LOGGER.info('Migrating root_table `{}` children from schema_version 1 to 2'.format(mapped_name))
 
                 table_path = tuple()
