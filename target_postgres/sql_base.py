@@ -25,6 +25,11 @@ from target_postgres import json_schema
 SEPARATOR = '__'
 CURRENT_SCHEMA_VERSION = 2
 
+# Marker prefix for Peliqan temporary/staging tables. Any table whose name
+# starts with this is an intermediate table created during a load and must be
+# excluded from schema discovery and cleaned up by the Peliqan backend.
+TEMP_TABLE_MARKER = 'pqtemp__'
+
 
 def _duration_millis(start):
     return int((time.monotonic() - start) * 1000)
