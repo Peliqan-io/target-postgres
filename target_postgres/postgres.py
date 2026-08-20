@@ -388,10 +388,6 @@ class PostgresTarget(SQLInterface):
 
         return ordered_deps
 
-    def metrics_tags(self):
-        return {'database': self.conn.get_dsn_parameters().get('dbname', None),
-                'schema': self.postgres_schema}
-
     def setup_table_mapping_cache(self, cur):
         self.table_mapping_cache = {}
 
@@ -416,7 +412,7 @@ class PostgresTarget(SQLInterface):
                     metadata = None
                 if isinstance(metadata, dict):
                     table_path = metadata.get('path', None)
-            self.LOGGER.info("Mapping: {} to {}".format(mapped_name, table_path))
+            self.LOGGER.debug("Mapping: {} to {}".format(mapped_name, table_path))
             if table_path:
                 self.table_mapping_cache[tuple(table_path)] = mapped_name
 

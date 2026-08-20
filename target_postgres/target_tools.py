@@ -8,7 +8,7 @@ import decimal
 import urllib.parse
 
 import singer
-from singer import utils, metadata, metrics
+from singer import utils, metadata
 
 from target_postgres import json_schema
 from target_postgres.exceptions import TargetError
