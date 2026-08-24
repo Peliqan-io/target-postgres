@@ -1178,6 +1178,13 @@ class PostgresTarget(SQLInterface):
             table=sql.Identifier(remote_schema['name'])
         ))
 
+        ## Stamp the run id on the batch table. CREATE TABLE ... (LIKE ...) copies no
+        ## comment, and this table is the one left behind when a run dies between the
+        ## CREATE above and the DROP at the end of the upsert in _get_update_sql.
+        ## commit=False: this runs between record batches, and committing here would
+        ## publish the preceding batches' rows into the live table early.
+        self._set_table_metadata(cur, target_table_name, {}, commit=False)
+
         ## Make streamable CSV records
         csv_headers = list(remote_schema['schema']['properties'].keys())
         rows_iter = iter(table_batch['records'])
@@ -1260,13 +1267,16 @@ class PostgresTarget(SQLInterface):
             table_name=sql.Identifier(table_name),
             column_names=sql.SQL(', ').join(sql.Identifier(column_name) for column_name in column_names)))
 
-    def _set_table_metadata(self, cur, table_name, metadata):
+    def _set_table_metadata(self, cur, table_name, metadata, commit=True):
         """
         Given a Metadata dict, set it as the comment on the given table.
         :param self: Postgres
         :param cur: Pscyopg.Cursor
         :param table_name: String
         :param metadata: Metadata Dict
+        :param commit: Whether to commit the open transaction afterwards. Schema
+            setup callers rely on the commit; callers writing between record
+            batches must pass False, or they publish half a batch's rows early.
         :return: None
         """
         # Postgres has a single metadata slot per table (COMMENT ON TABLE ->
@@ -1290,7 +1300,8 @@ class PostgresTarget(SQLInterface):
             sql.Identifier(self.postgres_schema),
             sql.Identifier(table_name),
             sql.Literal(json.dumps(metadata))))
-        cur.connection.commit()
+        if commit:
+            cur.connection.commit()
 
     def _get_table_metadata(self, cur, table_name):
         cur.execute(sql.SQL('''
