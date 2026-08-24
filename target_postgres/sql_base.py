@@ -31,6 +31,13 @@ CURRENT_SCHEMA_VERSION = 2
 # excluded from schema discovery and cleaned up by the Peliqan backend.
 TEMP_TABLE_MARKER = 'pqtemp__'
 
+# Environment variable the Peliqan backend sets on this process, carrying the id of
+# the pipeline run being executed. Stamped into the metadata of every
+# TEMP_TABLE_MARKER table this target creates, under PQ_RUN_ID_KEY, so the backend
+# can later drop only the temp tables belonging to runs that have finished.
+PIPELINE_RUN_ID_ENV_VAR = 'PELIQAN_PIPELINE_RUN_ID'
+PQ_RUN_ID_KEY = 'pq_run_id'
+
 
 def _duration_millis(start):
     return int((time.monotonic() - start) * 1000)
