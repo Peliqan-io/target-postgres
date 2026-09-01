@@ -18,7 +18,6 @@ import pickle
 import time
 
 import singer
-import singer.metrics as metrics
 
 from target_postgres import denest
 from target_postgres import json_schema
@@ -30,6 +29,41 @@ CURRENT_SCHEMA_VERSION = 2
 # starts with this is an intermediate table created during a load and must be
 # excluded from schema discovery and cleaned up by the Peliqan backend.
 TEMP_TABLE_MARKER = 'pqtemp__'
+
+
+class _DisabledMetric:
+    """
+    Inert stand-in for a `singer.metrics` Timer/Counter.
+
+    Singer's metrics convention exists so that *taps* can report extraction
+    stats to a collector. On the target side nothing ever consumed the
+    `METRIC:` lines these emitted, while they made up the bulk of every
+    pipeline log (PQ-3978). The instrumentation points below are deliberately
+    left where they are -- they simply no longer log.
+
+    This deliberately does not subclass or wrap `singer.metrics`, so nothing
+    here depends on that library's internals: if Singer changes, this cannot
+    silently start emitting again.
+
+    Unlike `singer.metrics.Counter`, `value` is never reset on a reporting
+    interval, so a batch running longer than 60s no longer under-reports
+    `rows_persisted`.
+    """
+
+    def __init__(self):
+        self.tags = {}
+        self.value = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # Returns None, never True: exceptions propagate exactly as they did
+        # through singer's Timer/Counter.
+        return None
+
+    def increment(self, amount=1):
+        self.value += amount
 
 
 def _duration_millis(start):
@@ -389,7 +423,7 @@ class SQLInterface:
         """
         table_path = schema['path']
 
-        with self._set_timer_tags(metrics.job_timer(is_target=True),
+        with self._set_timer_tags(_DisabledMetric(),
                                   'upsert_table_schema',
                                   table_path) as timer:
 
@@ -840,10 +874,10 @@ class SQLInterface:
         :return: {'records_persisted': int,
                   'rows_persisted': int}
         """
-        with self._set_timer_tags(metrics.job_timer(is_target=True),
+        with self._set_timer_tags(_DisabledMetric(),
                                   'batch',
                                   (root_table_name,)):
-            with self._set_counter_tags(metrics.record_counter(None, is_target=True),
+            with self._set_counter_tags(_DisabledMetric(),
                                         'batch_rows_persisted',
                                         (root_table_name,)) as batch_counter:
                 self.LOGGER.info('Writing batch with {} records for `{}` with `key_properties`: `{}`'.format(
@@ -856,10 +890,10 @@ class SQLInterface:
                     table_batch['streamed_schema']['path'] = (root_table_name,) + \
                                                              table_batch['streamed_schema']['path']
 
-                    with self._set_timer_tags(metrics.job_timer(is_target=True),
+                    with self._set_timer_tags(_DisabledMetric(),
                                               'table',
                                               table_batch['streamed_schema']['path']) as table_batch_timer:
-                        with self._set_counter_tags(metrics.record_counter(None, is_target=True),
+                        with self._set_counter_tags(_DisabledMetric(),
                                                     'table_rows_persisted',
                                                     table_batch['streamed_schema']['path']) as table_batch_counter:
                             self.LOGGER.info('Writing table batch schema for `{}`...'.format(

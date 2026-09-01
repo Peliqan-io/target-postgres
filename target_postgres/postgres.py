@@ -416,7 +416,7 @@ class PostgresTarget(SQLInterface):
                     metadata = None
                 if isinstance(metadata, dict):
                     table_path = metadata.get('path', None)
-            self.LOGGER.info("Mapping: {} to {}".format(mapped_name, table_path))
+            self.LOGGER.debug("Mapping: {} to {}".format(mapped_name, table_path))
             if table_path:
                 self.table_mapping_cache[tuple(table_path)] = mapped_name
 
