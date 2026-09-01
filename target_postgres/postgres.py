@@ -388,6 +388,10 @@ class PostgresTarget(SQLInterface):
 
         return ordered_deps
 
+    def metrics_tags(self):
+        return {'database': self.conn.get_dsn_parameters().get('dbname', None),
+                'schema': self.postgres_schema}
+
     def setup_table_mapping_cache(self, cur):
         self.table_mapping_cache = {}
 

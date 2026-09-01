@@ -31,6 +31,41 @@ CURRENT_SCHEMA_VERSION = 2
 TEMP_TABLE_MARKER = 'pqtemp__'
 
 
+class _DisabledMetric:
+    """
+    Inert stand-in for a `singer.metrics` Timer/Counter.
+
+    Singer's metrics convention exists so that *taps* can report extraction
+    stats to a collector. On the target side nothing ever consumed the
+    `METRIC:` lines these emitted, while they made up the bulk of every
+    pipeline log (PQ-3978). The instrumentation points below are deliberately
+    left where they are -- they simply no longer log.
+
+    This deliberately does not subclass or wrap `singer.metrics`, so nothing
+    here depends on that library's internals: if Singer changes, this cannot
+    silently start emitting again.
+
+    Unlike `singer.metrics.Counter`, `value` is never reset on a reporting
+    interval, so a batch running longer than 60s no longer under-reports
+    `rows_persisted`.
+    """
+
+    def __init__(self):
+        self.tags = {}
+        self.value = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # Returns None, never True: exceptions propagate exactly as they did
+        # through singer's Timer/Counter.
+        return None
+
+    def increment(self, amount=1):
+        self.value += amount
+
+
 def _duration_millis(start):
     return int((time.monotonic() - start) * 1000)
 
@@ -58,6 +93,34 @@ class SQLInterface:
 
     IDENTIFIER_FIELD_LENGTH = NotImplementedError('`IDENTIFIER_FIELD_LENGTH` not implemented.')
     LOGGER = singer.get_logger(is_target=True)
+
+    def _set_timer_tags(self, metric, job_type, path):
+        metric.tags['job_type'] = job_type
+        metric.tags['path'] = path
+
+        metric.tags.update(self.metrics_tags())
+
+        return metric
+
+    def _set_counter_tags(self, metric, counter_type, path):
+        metric.tags['count_type'] = counter_type
+        metric.tags['path'] = path
+
+        metric.tags.update(self.metrics_tags())
+
+        return metric
+
+    def _set_metrics_tags__table(self, metric, table_name):
+        metric.tags['table'] = table_name
+
+        return metric
+
+    def metrics_tags(self):
+        """
+        Optional function to overwrite to include more tags into Singer Metrics.
+        :return: Dictonary of Tags
+        """
+        return {}
 
     def json_schema_to_sql_type(self, schema):
         """
@@ -360,248 +423,254 @@ class SQLInterface:
         """
         table_path = schema['path']
 
-        _metadata = deepcopy(metadata)
-        _metadata['schema_version'] = CURRENT_SCHEMA_VERSION
+        with self._set_timer_tags(_DisabledMetric(),
+                                  'upsert_table_schema',
+                                  table_path) as timer:
 
-        table_name = self.add_table_mapping(connection, table_path, _metadata)
+            _metadata = deepcopy(metadata)
+            _metadata['schema_version'] = CURRENT_SCHEMA_VERSION
 
-        existing_schema = self._get_table_schema(connection, table_name)
+            table_name = self.add_table_mapping(connection, table_path, _metadata)
 
-        existing_table = True
-        if existing_schema is None:
-            self.add_table(connection, table_path, table_name, _metadata)
+            self._set_metrics_tags__table(timer, table_name)
+
             existing_schema = self._get_table_schema(connection, table_name)
-            existing_table = False
 
-        self.add_key_properties(connection, table_name, schema.get('key_properties', None))
+            existing_table = True
+            if existing_schema is None:
+                self.add_table(connection, table_path, table_name, _metadata)
+                existing_schema = self._get_table_schema(connection, table_name)
+                existing_table = False
 
-        ## Build up mappings to compare new columns against existing
-        mappings = []
+            self.add_key_properties(connection, table_name, schema.get('key_properties', None))
 
-        for to, m in existing_schema.get('mappings', {}).items():
-            mapping = json_schema.simple_type(m)
-            mapping['from'] = tuple(m['from'])
-            mapping['to'] = to
-            mappings.append(mapping)
+            ## Build up mappings to compare new columns against existing
+            mappings = []
 
-        ## Only process columns which have single, nullable, types
-        column_paths_seen = set()
-        single_type_columns = []
+            for to, m in existing_schema.get('mappings', {}).items():
+                mapping = json_schema.simple_type(m)
+                mapping['from'] = tuple(m['from'])
+                mapping['to'] = to
+                mappings.append(mapping)
 
-        for column_path, column_schema in schema['schema']['properties'].items():
-            column_paths_seen.add(column_path)
-            for sub_schema in column_schema['anyOf']:
-                single_type_columns.append((column_path, deepcopy(sub_schema)))
+            ## Only process columns which have single, nullable, types
+            column_paths_seen = set()
+            single_type_columns = []
 
-        ### Add any columns missing from new schema
-        for m in mappings:
-            if not m['from'] in column_paths_seen:
-                single_type_columns.append((m['from'], json_schema.make_nullable(m)))
+            for column_path, column_schema in schema['schema']['properties'].items():
+                column_paths_seen.add(column_path)
+                for sub_schema in column_schema['anyOf']:
+                    single_type_columns.append((column_path, deepcopy(sub_schema)))
 
-        ## Process new columns against existing
-        table_empty = self.is_table_empty(connection, table_name)
+            ### Add any columns missing from new schema
+            for m in mappings:
+                if not m['from'] in column_paths_seen:
+                    single_type_columns.append((m['from'], json_schema.make_nullable(m)))
 
-        for column_path, column_schema in single_type_columns:
-            upsert_table_helper__start__column = time.monotonic()
+            ## Process new columns against existing
+            table_empty = self.is_table_empty(connection, table_name)
 
-            canonicalized_column_name = self._canonicalize_column_identifier(column_path, column_schema, mappings)
-            nullable_column_schema = json_schema.make_nullable(column_schema)
+            for column_path, column_schema in single_type_columns:
+                upsert_table_helper__start__column = time.monotonic()
 
-            def log_message(msg):
-                if log_schema_changes:
-                    self.LOGGER.info(
-                        'Table Schema Change [`{}`.`{}`:`{}`] {} (took {} millis)'.format(
-                            table_name,
+                canonicalized_column_name = self._canonicalize_column_identifier(column_path, column_schema, mappings)
+                nullable_column_schema = json_schema.make_nullable(column_schema)
+
+                def log_message(msg):
+                    if log_schema_changes:
+                        self.LOGGER.info(
+                            'Table Schema Change [`{}`.`{}`:`{}`] {} (took {} millis)'.format(
+                                table_name,
+                                column_path,
+                                canonicalized_column_name,
+                                msg,
+                                _duration_millis(upsert_table_helper__start__column)))
+
+                ## NEW COLUMN
+                if not column_path in [m['from'] for m in mappings]:
+                    upsert_table_helper__column = "New column"
+                    ### NON EMPTY TABLE
+                    if not table_empty:
+                        upsert_table_helper__column += ", non empty table"
+                        self.LOGGER.warning(
+                            'NOT EMPTY: Forcing new column `{}` in table `{}` to be nullable due to table not empty.'.format(
+                                column_path,
+                                table_name))
+                        column_schema = nullable_column_schema
+
+                    self.add_column(connection,
+                                    table_name,
+                                    canonicalized_column_name,
+                                    column_schema)
+                    
+                    
+                    self.add_column_mapping(connection,
+                                            table_name,
+                                            column_path,
+                                            canonicalized_column_name,
+                                            column_schema)
+
+                    mapping = json_schema.simple_type(column_schema)
+                    mapping['from'] = column_path
+                    mapping['to'] = canonicalized_column_name
+                    mappings.append(mapping)
+
+                    log_message(upsert_table_helper__column)
+
+                    continue
+
+                ## EXISTING COLUMNS
+                ### SCHEMAS MATCH
+                if [True for m in mappings if
+                    m['from'] == column_path
+                    and self.json_schema_to_sql_type(m) == self.json_schema_to_sql_type(column_schema)]:
+                    continue
+                ### NULLABLE SCHEMAS MATCH
+                ###  New column _is not_ nullable, existing column _is_
+                if [True for m in mappings if
+                    m['from'] == column_path
+                    and self.json_schema_to_sql_type(m) == self.json_schema_to_sql_type(nullable_column_schema)]:
+                    continue
+
+                ### NULL COMPATIBILITY
+                ###  New column _is_ nullable, existing column is _not_
+                non_null_original_column = [m for m in mappings if
+                                            m['from'] == column_path and json_schema.shorthand(
+                                                m) == json_schema.shorthand(column_schema)]
+                if non_null_original_column:
+                    ## MAKE NULLABLE
+                    self.make_column_nullable(connection,
+                                              table_name,
+                                              canonicalized_column_name)
+                    self.drop_column_mapping(connection, table_name, canonicalized_column_name)
+                    self.add_column_mapping(connection,
+                                            table_name,
+                                            column_path,
+                                            canonicalized_column_name,
+                                            nullable_column_schema)
+
+                    mappings = [m for m in mappings if not (m['from'] == column_path and json_schema.shorthand(
+                        m) == json_schema.shorthand(column_schema))]
+
+                    mapping = json_schema.simple_type(nullable_column_schema)
+                    mapping['from'] = column_path
+                    mapping['to'] = canonicalized_column_name
+                    mappings.append(mapping)
+
+                    log_message("Made existing column nullable.")
+
+                    continue
+
+                ### FIRST MULTI TYPE
+                ###  New column matches existing column path, but the types are incompatible
+                duplicate_paths = [m for m in mappings if m['from'] == column_path]
+
+                if 1 == len(duplicate_paths):
+                    existing_mapping = duplicate_paths[0]
+                    existing_column_name = existing_mapping['to']
+
+                    if existing_column_name:
+                        self.drop_column_mapping(connection, table_name, existing_column_name)
+
+                    ## Update existing properties
+                    mappings = [m for m in mappings if m['from'] != column_path]
+
+                    mapping = json_schema.simple_type(nullable_column_schema)
+                    mapping['from'] = column_path
+                    mapping['to'] = canonicalized_column_name
+                    mappings.append(mapping)
+
+                    existing_column_new_normalized_name = self._canonicalize_column_identifier(column_path,
+                                                                                               existing_mapping,
+                                                                                               mappings)
+
+                    mapping = json_schema.simple_type(json_schema.make_nullable(existing_mapping))
+                    mapping['from'] = column_path
+                    mapping['to'] = existing_column_new_normalized_name
+                    mappings.append(mapping)
+
+                    ## Add new columns
+                    ### NOTE: all migrated columns will be nullable and remain that way
+
+                    #### Table Metadata
+                    self.add_column_mapping(connection,
+                                            table_name,
+                                            column_path,
+                                            existing_column_new_normalized_name,
+                                            json_schema.make_nullable(existing_mapping))
+                    self.add_column_mapping(connection,
+                                            table_name,
+                                            column_path,
+                                            canonicalized_column_name,
+                                            nullable_column_schema)
+
+                    #### Columns
+                    self.add_column(connection,
+                                    table_name,
+                                    existing_column_new_normalized_name,
+                                    json_schema.make_nullable(existing_mapping))
+
+                    self.add_column(connection,
+                                    table_name,
+                                    canonicalized_column_name,
+                                    nullable_column_schema)
+
+                    ## Migrate existing data
+                    self.migrate_column(connection,
+                                        table_name,
+                                        existing_mapping['to'],
+                                        existing_column_new_normalized_name)
+
+                    ## Drop existing column
+                    self.drop_column(connection,
+                                     table_name,
+                                     existing_mapping['to'])
+
+                    upsert_table_helper__column = "Splitting `{}` into `{}` and `{}`. New column matches existing column path, but the types are incompatible.".format(
+                        existing_column_name,
+                        existing_column_new_normalized_name,
+                        canonicalized_column_name
+                    )
+
+                ## REST MULTI TYPE
+                elif 1 < len(duplicate_paths):
+                    ## Add new column
+                    self.add_column_mapping(connection,
+                                            table_name,
+                                            column_path,
+                                            canonicalized_column_name,
+                                            nullable_column_schema)
+                    self.add_column(connection,
+                                    table_name,
+                                    canonicalized_column_name,
+                                    nullable_column_schema)
+
+                    mapping = json_schema.simple_type(nullable_column_schema)
+                    mapping['from'] = column_path
+                    mapping['to'] = canonicalized_column_name
+                    mappings.append(mapping)
+
+                    upsert_table_helper__column = "Adding new column to split column `{}`. New column matches existing column's path, but no types were compatible.".format(
+                        column_path
+                    )
+
+                ## UNKNOWN
+                else:
+                    raise Exception(
+                        'UNKNOWN: Cannot handle merging column `{}` (canonicalized as: `{}`) in table `{}`.'.format(
                             column_path,
                             canonicalized_column_name,
-                            msg,
-                            _duration_millis(upsert_table_helper__start__column)))
-
-            ## NEW COLUMN
-            if not column_path in [m['from'] for m in mappings]:
-                upsert_table_helper__column = "New column"
-                ### NON EMPTY TABLE
-                if not table_empty:
-                    upsert_table_helper__column += ", non empty table"
-                    self.LOGGER.warning(
-                        'NOT EMPTY: Forcing new column `{}` in table `{}` to be nullable due to table not empty.'.format(
-                            column_path,
-                            table_name))
-                    column_schema = nullable_column_schema
-
-                self.add_column(connection,
-                                table_name,
-                                canonicalized_column_name,
-                                column_schema)
-                
-                
-                self.add_column_mapping(connection,
-                                        table_name,
-                                        column_path,
-                                        canonicalized_column_name,
-                                        column_schema)
-
-                mapping = json_schema.simple_type(column_schema)
-                mapping['from'] = column_path
-                mapping['to'] = canonicalized_column_name
-                mappings.append(mapping)
+                            table_name
+                        ))
 
                 log_message(upsert_table_helper__column)
 
-                continue
+            if not existing_table:
+                for column_names in self.new_table_indexes(schema):
+                    self.add_index(connection, table_name, column_names)
+                self.add_primary_key(connection, table_name, schema.get('key_properties', None))
 
-            ## EXISTING COLUMNS
-            ### SCHEMAS MATCH
-            if [True for m in mappings if
-                m['from'] == column_path
-                and self.json_schema_to_sql_type(m) == self.json_schema_to_sql_type(column_schema)]:
-                continue
-            ### NULLABLE SCHEMAS MATCH
-            ###  New column _is not_ nullable, existing column _is_
-            if [True for m in mappings if
-                m['from'] == column_path
-                and self.json_schema_to_sql_type(m) == self.json_schema_to_sql_type(nullable_column_schema)]:
-                continue
-
-            ### NULL COMPATIBILITY
-            ###  New column _is_ nullable, existing column is _not_
-            non_null_original_column = [m for m in mappings if
-                                        m['from'] == column_path and json_schema.shorthand(
-                                            m) == json_schema.shorthand(column_schema)]
-            if non_null_original_column:
-                ## MAKE NULLABLE
-                self.make_column_nullable(connection,
-                                          table_name,
-                                          canonicalized_column_name)
-                self.drop_column_mapping(connection, table_name, canonicalized_column_name)
-                self.add_column_mapping(connection,
-                                        table_name,
-                                        column_path,
-                                        canonicalized_column_name,
-                                        nullable_column_schema)
-
-                mappings = [m for m in mappings if not (m['from'] == column_path and json_schema.shorthand(
-                    m) == json_schema.shorthand(column_schema))]
-
-                mapping = json_schema.simple_type(nullable_column_schema)
-                mapping['from'] = column_path
-                mapping['to'] = canonicalized_column_name
-                mappings.append(mapping)
-
-                log_message("Made existing column nullable.")
-
-                continue
-
-            ### FIRST MULTI TYPE
-            ###  New column matches existing column path, but the types are incompatible
-            duplicate_paths = [m for m in mappings if m['from'] == column_path]
-
-            if 1 == len(duplicate_paths):
-                existing_mapping = duplicate_paths[0]
-                existing_column_name = existing_mapping['to']
-
-                if existing_column_name:
-                    self.drop_column_mapping(connection, table_name, existing_column_name)
-
-                ## Update existing properties
-                mappings = [m for m in mappings if m['from'] != column_path]
-
-                mapping = json_schema.simple_type(nullable_column_schema)
-                mapping['from'] = column_path
-                mapping['to'] = canonicalized_column_name
-                mappings.append(mapping)
-
-                existing_column_new_normalized_name = self._canonicalize_column_identifier(column_path,
-                                                                                           existing_mapping,
-                                                                                           mappings)
-
-                mapping = json_schema.simple_type(json_schema.make_nullable(existing_mapping))
-                mapping['from'] = column_path
-                mapping['to'] = existing_column_new_normalized_name
-                mappings.append(mapping)
-
-                ## Add new columns
-                ### NOTE: all migrated columns will be nullable and remain that way
-
-                #### Table Metadata
-                self.add_column_mapping(connection,
-                                        table_name,
-                                        column_path,
-                                        existing_column_new_normalized_name,
-                                        json_schema.make_nullable(existing_mapping))
-                self.add_column_mapping(connection,
-                                        table_name,
-                                        column_path,
-                                        canonicalized_column_name,
-                                        nullable_column_schema)
-
-                #### Columns
-                self.add_column(connection,
-                                table_name,
-                                existing_column_new_normalized_name,
-                                json_schema.make_nullable(existing_mapping))
-
-                self.add_column(connection,
-                                table_name,
-                                canonicalized_column_name,
-                                nullable_column_schema)
-
-                ## Migrate existing data
-                self.migrate_column(connection,
-                                    table_name,
-                                    existing_mapping['to'],
-                                    existing_column_new_normalized_name)
-
-                ## Drop existing column
-                self.drop_column(connection,
-                                 table_name,
-                                 existing_mapping['to'])
-
-                upsert_table_helper__column = "Splitting `{}` into `{}` and `{}`. New column matches existing column path, but the types are incompatible.".format(
-                    existing_column_name,
-                    existing_column_new_normalized_name,
-                    canonicalized_column_name
-                )
-
-            ## REST MULTI TYPE
-            elif 1 < len(duplicate_paths):
-                ## Add new column
-                self.add_column_mapping(connection,
-                                        table_name,
-                                        column_path,
-                                        canonicalized_column_name,
-                                        nullable_column_schema)
-                self.add_column(connection,
-                                table_name,
-                                canonicalized_column_name,
-                                nullable_column_schema)
-
-                mapping = json_schema.simple_type(nullable_column_schema)
-                mapping['from'] = column_path
-                mapping['to'] = canonicalized_column_name
-                mappings.append(mapping)
-
-                upsert_table_helper__column = "Adding new column to split column `{}`. New column matches existing column's path, but no types were compatible.".format(
-                    column_path
-                )
-
-            ## UNKNOWN
-            else:
-                raise Exception(
-                    'UNKNOWN: Cannot handle merging column `{}` (canonicalized as: `{}`) in table `{}`.'.format(
-                        column_path,
-                        canonicalized_column_name,
-                        table_name
-                    ))
-
-            log_message(upsert_table_helper__column)
-
-        if not existing_table:
-            for column_names in self.new_table_indexes(schema):
-                self.add_index(connection, table_name, column_names)
-            self.add_primary_key(connection, table_name, schema.get('key_properties', None))
-
-        return self._get_table_schema(connection, table_name)
+            return self._get_table_schema(connection, table_name)
 
     def _serialize_table_record_field_name(self, remote_schema, path, value_json_schema_tuple):
         """
@@ -805,45 +874,59 @@ class SQLInterface:
         :return: {'records_persisted': int,
                   'rows_persisted': int}
         """
-        self.LOGGER.info('Writing batch with {} records for `{}` with `key_properties`: `{}`'.format(
-            len(records),
-            root_table_name,
-            key_properties
-        ))
+        with self._set_timer_tags(_DisabledMetric(),
+                                  'batch',
+                                  (root_table_name,)):
+            with self._set_counter_tags(_DisabledMetric(),
+                                        'batch_rows_persisted',
+                                        (root_table_name,)) as batch_counter:
+                self.LOGGER.info('Writing batch with {} records for `{}` with `key_properties`: `{}`'.format(
+                    len(records),
+                    root_table_name,
+                    key_properties
+                ))
 
-        rows_persisted = 0
+                for table_batch in denest.to_table_batches(schema, key_properties, records):
+                    table_batch['streamed_schema']['path'] = (root_table_name,) + \
+                                                             table_batch['streamed_schema']['path']
 
-        for table_batch in denest.to_table_batches(schema, key_properties, records):
-            table_batch['streamed_schema']['path'] = (root_table_name,) + \
-                                                     table_batch['streamed_schema']['path']
+                    with self._set_timer_tags(_DisabledMetric(),
+                                              'table',
+                                              table_batch['streamed_schema']['path']) as table_batch_timer:
+                        with self._set_counter_tags(_DisabledMetric(),
+                                                    'table_rows_persisted',
+                                                    table_batch['streamed_schema']['path']) as table_batch_counter:
+                            self.LOGGER.info('Writing table batch schema for `{}`...'.format(
+                                table_batch['streamed_schema']['path']
+                            ))
 
-            self.LOGGER.info('Writing table batch schema for `{}`...'.format(
-                table_batch['streamed_schema']['path']
-            ))
+                            remote_schema = self.upsert_table_helper(connection,
+                                                                     table_batch['streamed_schema'],
+                                                                     metadata)
 
-            remote_schema = self.upsert_table_helper(connection,
-                                                     table_batch['streamed_schema'],
-                                                     metadata)
+                            self._set_metrics_tags__table(table_batch_timer, remote_schema['name'])
+                            self._set_metrics_tags__table(table_batch_counter, remote_schema['name'])
 
-            self.LOGGER.info('Writing table batch with {} rows for `{}`...'.format(
-                len(table_batch['records']),
-                table_batch['streamed_schema']['path']
-            ))
+                            self.LOGGER.info('Writing table batch with {} rows for `{}`...'.format(
+                                len(table_batch['records']),
+                                table_batch['streamed_schema']['path']
+                            ))
 
-            batch_rows_persisted = self.write_table_batch(
-                connection,
-                {'remote_schema': remote_schema,
-                 'records': self._serialize_table_records(remote_schema,
-                                                          table_batch['streamed_schema'],
-                                                          table_batch['records'])},
-                metadata)
+                            batch_rows_persisted = self.write_table_batch(
+                                connection,
+                                {'remote_schema': remote_schema,
+                                 'records': self._serialize_table_records(remote_schema,
+                                                                          table_batch['streamed_schema'],
+                                                                          table_batch['records'])},
+                                metadata)
 
-            rows_persisted += batch_rows_persisted
+                            table_batch_counter.increment(batch_rows_persisted)
+                            batch_counter.increment(batch_rows_persisted)
 
-        return {
-            'records_persisted': len(records),
-            'rows_persisted': rows_persisted
-        }
+                return {
+                    'records_persisted': len(records),
+                    'rows_persisted': batch_counter.value
+                }
 
     def write_batch(self, stream_buffer):
         """
