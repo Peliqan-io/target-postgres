@@ -486,13 +486,22 @@ class PostgresTarget(SQLInterface):
                                 self.conn.rollback()
                                 return None
 
-                            elif stream_buffer.max_version > current_table_version:
-                                # Write the new full-table version into a marked staging table
-                                # (pqtemp__<stream>__<version>). activate_version() renames it onto
-                                # the clean stream name, so the published table is never marked. The
-                                # marker keeps the in-flight staging table out of schema discovery.
-                                root_table_name = TEMP_TABLE_MARKER + root_table_name + SEPARATOR + str(stream_buffer.max_version)
-                                target_table_version = stream_buffer.max_version
+                        # Stage when this run's version is newer than the live table's, or when
+                        # the live table exists but has no version (loaded INCREMENTAL /
+                        # non-versioned) and this run's records are versioned (remove-deleted-rows
+                        # run). Without the second case versioned records merge into the live
+                        # table and ACTIVATE_VERSION removes nothing. A table that does not exist
+                        # yet is still written directly: activate_version() cannot swap it in.
+                        if stream_buffer.max_version is not None and (
+                                (current_table_version is not None
+                                 and stream_buffer.max_version > current_table_version)
+                                or (current_table_schema and current_table_version is None)):
+                            # Write the new full-table version into a marked staging table
+                            # (pqtemp__<stream>__<version>). activate_version() renames it onto
+                            # the clean stream name, so the published table is never marked. The
+                            # marker keeps the in-flight staging table out of schema discovery.
+                            root_table_name = TEMP_TABLE_MARKER + root_table_name + SEPARATOR + str(stream_buffer.max_version)
+                            target_table_version = stream_buffer.max_version
 
                         self.LOGGER.info('Root table name {}'.format(root_table_name))
 
