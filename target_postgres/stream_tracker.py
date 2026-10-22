@@ -49,28 +49,32 @@ class StreamTracker:
         self.stream_flush_watermarks[stream] = 0
 
     def flush_stream(self, stream):
-        self._flush_deletes_then_records(stream)
-        self._emit_safe_queued_states()
-
-    def flush_streams(self, force=False):
-        delete_batch_size = getattr(self.target, 'DELETE_BATCH_SIZE', DEFAULT_DELETE_BATCH_SIZE)
-        due = [stream for stream, buffer in self.streams.items() if force or buffer.buffer_full]
-        due += [stream for stream, deletes in self.delete_buffers.items()
-                if (force or len(deletes) >= delete_batch_size) and stream not in due]
-        for stream in due:
-            self._flush_deletes_then_records(stream)
-
-        self._emit_safe_queued_states(force=force)
-
-    def _flush_deletes_then_records(self, stream):
-        # Deletes before inserts (PQ-4461): a delete followed by a re-insert of the
-        # same key in one flush keeps the re-inserted rows. A stream's deletes and
-        # records are always flushed together, so its flush watermark never covers
-        # records that were not written yet.
+        # Flush deletes before records so a delete followed by a re-insert of the
+        # same key in one flush keeps the re-inserted records.
         if stream in self.delete_buffers:
             self._flush_deletes(stream)
         if stream in self.streams:
             self._write_batch_and_update_watermarks(stream)
+        self._emit_safe_queued_states()
+
+    def flush_streams(self, force=False):
+        delete_batch_size = getattr(self.target, 'DELETE_BATCH_SIZE', DEFAULT_DELETE_BATCH_SIZE)
+        for (stream, stream_buffer) in self.streams.items():
+            # A full delete buffer also writes the stream's records, so its flush
+            # watermark never covers records that were not written yet.
+            deletes_full = len(self.delete_buffers.get(stream, [])) >= delete_batch_size
+            if force or stream_buffer.buffer_full or deletes_full:
+                # Deletes before records (same ordering rationale as above).
+                if stream in self.delete_buffers:
+                    self._flush_deletes(stream)
+                self._write_batch_and_update_watermarks(stream)
+
+        # Deletes of streams without records in this run (e.g. a delete-only run).
+        for stream in list(self.delete_buffers.keys()):
+            if force or len(self.delete_buffers[stream]) >= delete_batch_size:
+                self._flush_deletes(stream)
+
+        self._emit_safe_queued_states(force=force)
 
     def handle_state_message(self, line):
         if self.emit_states:

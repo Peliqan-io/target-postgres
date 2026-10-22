@@ -3,8 +3,8 @@ Unit tests for DELETERECORD routing through target_tools / StreamTracker.
 
 These verify that a DELETERECORD Singer message is buffered and dispatched to the
 target's delete_records(), that a stream's deletes are flushed before its record
-batches (so a delete + re-insert of the same key keeps the new rows), that deletes for un-synced
-streams are still routed, and that a malformed DELETERECORD raises.
+batches (so a delete + re-insert of the same key keeps the new rows), that deletes
+for un-synced streams are still routed, and that a malformed DELETERECORD raises.
 
 No live Postgres needed: a fake target records the calls it receives.
 """
