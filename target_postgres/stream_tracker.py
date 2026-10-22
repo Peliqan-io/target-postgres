@@ -49,26 +49,28 @@ class StreamTracker:
         self.stream_flush_watermarks[stream] = 0
 
     def flush_stream(self, stream):
-        if stream in self.streams:
-            self._write_batch_and_update_watermarks(stream)
-        # Flush deletes after records so an upsert + delete of the same PK in the
-        # same run ends up deleted.
-        if stream in self.delete_buffers:
-            self._flush_deletes(stream)
+        self._flush_deletes_then_records(stream)
         self._emit_safe_queued_states()
 
     def flush_streams(self, force=False):
-        for (stream, stream_buffer) in self.streams.items():
-            if force or stream_buffer.buffer_full:
-                self._write_batch_and_update_watermarks(stream)
-
-        # Flush delete buffers after record batches (same ordering rationale as above).
         delete_batch_size = getattr(self.target, 'DELETE_BATCH_SIZE', DEFAULT_DELETE_BATCH_SIZE)
-        for stream in list(self.delete_buffers.keys()):
-            if force or len(self.delete_buffers[stream]) >= delete_batch_size:
-                self._flush_deletes(stream)
+        due = [stream for stream, buffer in self.streams.items() if force or buffer.buffer_full]
+        due += [stream for stream, deletes in self.delete_buffers.items()
+                if (force or len(deletes) >= delete_batch_size) and stream not in due]
+        for stream in due:
+            self._flush_deletes_then_records(stream)
 
         self._emit_safe_queued_states(force=force)
+
+    def _flush_deletes_then_records(self, stream):
+        # Deletes before inserts (PQ-4461): a delete followed by a re-insert of the
+        # same key in one flush keeps the re-inserted rows. A stream's deletes and
+        # records are always flushed together, so its flush watermark never covers
+        # records that were not written yet.
+        if stream in self.delete_buffers:
+            self._flush_deletes(stream)
+        if stream in self.streams:
+            self._write_batch_and_update_watermarks(stream)
 
     def handle_state_message(self, line):
         if self.emit_states:
