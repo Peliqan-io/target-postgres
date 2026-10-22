@@ -84,8 +84,8 @@ def test_deletes_flushed_before_records():
 
 
 # WHY: when a stream's delete buffer fills before its record buffer, the stream's
-#      buffered records are written in the same flush, so the flush watermark (and
-#      the STATE it releases) never covers records that were not written yet.
+#      buffered records are written in the same (non-forced) flush, so the flush
+#      watermark (and the STATE it releases) never covers records not written yet.
 def test_full_delete_buffer_also_flushes_that_streams_records():
     target = FakeTarget()
     target.DELETE_BATCH_SIZE = 2
@@ -94,13 +94,17 @@ def test_full_delete_buffer_also_flushes_that_streams_records():
         _line({"type": "RECORD", "stream": "accounts", "record": {"id": 10}}),
         _line({"type": "DELETERECORD", "stream": "accounts", "record": {"id": 1}}),
         _line({"type": "DELETERECORD", "stream": "accounts", "record": {"id": 2}}),
+        _line({"type": "RECORD", "stream": "accounts", "record": {"id": 11}}),
     ]
 
-    target_tools.stream_to_target(lines, target, config=CONFIG)
+    # check for a flush after every line, so the full delete buffer triggers one
+    # before the end-of-input forced flush
+    target_tools.stream_to_target(lines, target, config=dict(CONFIG, batch_detection_threshold=1))
 
-    assert target.calls[:2] == [
+    assert target.calls == [
         ("delete_records", "accounts", [{"id": 1}, {"id": 2}]),
-        ("write_batch", "accounts", 1),
+        ("write_batch", "accounts", 1),   # record 10, written with the deletes
+        ("write_batch", "accounts", 1),   # record 11, at the end-of-input flush
     ]
 
 
