@@ -4,6 +4,7 @@ from functools import lru_cache
 import io
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -17,7 +18,13 @@ from psycopg2.extras import LoggingConnection, LoggingCursor
 
 from target_postgres import json_schema, singer
 from target_postgres.exceptions import PostgresError
-from target_postgres.sql_base import SEPARATOR, TEMP_TABLE_MARKER, SQLInterface
+from target_postgres.sql_base import (
+    PIPELINE_RUN_ID_ENV_VAR,
+    PQ_RUN_ID_KEY,
+    SEPARATOR,
+    TEMP_TABLE_MARKER,
+    SQLInterface,
+)
 
 
 RESERVED_NULL_DEFAULT = 'NULL'
@@ -1171,6 +1178,13 @@ class PostgresTarget(SQLInterface):
             table=sql.Identifier(remote_schema['name'])
         ))
 
+        ## Stamp the run id on the batch table. CREATE TABLE ... (LIKE ...) copies no
+        ## comment, and this table is the one left behind when a run dies between the
+        ## CREATE above and the DROP at the end of the upsert in _get_update_sql.
+        ## commit=False: this runs between record batches, and committing here would
+        ## publish the preceding batches' rows into the live table early.
+        self._set_table_metadata(cur, target_table_name, {}, commit=False)
+
         ## Make streamable CSV records
         csv_headers = list(remote_schema['schema']['properties'].keys())
         rows_iter = iter(table_batch['records'])
@@ -1253,20 +1267,41 @@ class PostgresTarget(SQLInterface):
             table_name=sql.Identifier(table_name),
             column_names=sql.SQL(', ').join(sql.Identifier(column_name) for column_name in column_names)))
 
-    def _set_table_metadata(self, cur, table_name, metadata):
+    def _set_table_metadata(self, cur, table_name, metadata, commit=True):
         """
         Given a Metadata dict, set it as the comment on the given table.
         :param self: Postgres
         :param cur: Pscyopg.Cursor
         :param table_name: String
         :param metadata: Metadata Dict
+        :param commit: Whether to commit the open transaction afterwards. Schema
+            setup callers rely on the commit; callers writing between record
+            batches must pass False, or they publish half a batch's rows early.
         :return: None
         """
+        # Postgres has a single metadata slot per table (COMMENT ON TABLE ->
+        # pg_description), which already holds the Singer mappings, so the pipeline
+        # run id has to ride along inside the same JSON envelope -- writing it
+        # separately would clobber them. Readers are unaffected: they look up their
+        # own keys and ignore the rest.
+        #
+        # Only temp tables are stamped, and live tables are actively UNstamped:
+        # activate_version renames a pqtemp__ staging table onto the live name, and
+        # Postgres carries the comment across ALTER TABLE ... RENAME, so a published
+        # table would otherwise inherit and keep a stale run id.
+        metadata = dict(metadata)
+        run_id = os.environ.get(PIPELINE_RUN_ID_ENV_VAR)
+        if run_id and table_name.startswith(TEMP_TABLE_MARKER):
+            metadata[PQ_RUN_ID_KEY] = run_id
+        else:
+            metadata.pop(PQ_RUN_ID_KEY, None)
+
         cur.execute(sql.SQL('COMMENT ON TABLE {}.{} IS {};').format(
             sql.Identifier(self.postgres_schema),
             sql.Identifier(table_name),
             sql.Literal(json.dumps(metadata))))
-        cur.connection.commit()
+        if commit:
+            cur.connection.commit()
 
     def _get_table_metadata(self, cur, table_name):
         cur.execute(sql.SQL('''
