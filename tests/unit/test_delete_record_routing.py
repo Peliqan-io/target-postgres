@@ -2,9 +2,9 @@
 Unit tests for DELETERECORD routing through target_tools / StreamTracker.
 
 These verify that a DELETERECORD Singer message is buffered and dispatched to the
-target's delete_records(), that record batches are flushed before deletes (so an
-upsert + delete of the same PK ends up deleted), that deletes for un-synced
-streams are still routed, and that a malformed DELETERECORD raises.
+target's delete_records(), that a stream's deletes are flushed before its record
+batches (so a delete + re-insert of the same key keeps the new rows), that deletes
+for un-synced streams are still routed, and that a malformed DELETERECORD raises.
 
 No live Postgres needed: a fake target records the calls it receives.
 """
@@ -67,20 +67,45 @@ def test_delete_record_routed_to_delete_records():
     assert _delete_calls(target) == [("delete_records", "accounts", [{"id": 2}])]
 
 
-# WHY: record batches must flush before deletes so insert+delete of the same PK
-#      in one run results in the row being deleted.
-def test_records_flushed_before_deletes():
+# WHY: deletes flush before record batches (PQ-4461), so a delete followed by a
+#      re-insert of the same key in one run keeps the re-inserted row.
+def test_deletes_flushed_before_records():
     target = FakeTarget()
     lines = [
         _line(SCHEMA),
-        _line({"type": "RECORD", "stream": "accounts", "record": {"id": 1}}),
         _line({"type": "DELETERECORD", "stream": "accounts", "record": {"id": 1}}),
+        _line({"type": "RECORD", "stream": "accounts", "record": {"id": 1}}),
     ]
 
     target_tools.stream_to_target(lines, target, config=CONFIG)
 
     kinds = [c[0] for c in target.calls]
-    assert kinds.index("write_batch") < kinds.index("delete_records")
+    assert kinds.index("delete_records") < kinds.index("write_batch")
+
+
+# WHY: when a stream's delete buffer fills before its record buffer, the stream's
+#      buffered records are written in the same (non-forced) flush, so the flush
+#      watermark (and the STATE it releases) never covers records not written yet.
+def test_full_delete_buffer_also_flushes_that_streams_records():
+    target = FakeTarget()
+    target.DELETE_BATCH_SIZE = 2
+    lines = [
+        _line(SCHEMA),
+        _line({"type": "RECORD", "stream": "accounts", "record": {"id": 10}}),
+        _line({"type": "DELETERECORD", "stream": "accounts", "record": {"id": 1}}),
+        _line({"type": "DELETERECORD", "stream": "accounts", "record": {"id": 2}}),
+        _line({"type": "RECORD", "stream": "accounts", "record": {"id": 11}}),
+    ]
+
+    # check for a flush after every line, so the full delete buffer triggers one
+    # before the end-of-input forced flush
+    target_tools.stream_to_target(lines, target, config=dict(CONFIG, batch_detection_threshold=1))
+
+    assert target.calls == [
+        ("delete_records", "accounts", [{"id": 1}, {"id": 2}]),
+        ("write_batch", "accounts", 1),   # record 10, written with the deletes
+        ("write_batch", "accounts", 1),   # record 11, at the end-of-input flush
+    ]
 
 
 # WHY: a delete can target a table that had no SCHEMA/RECORD this run (e.g. a
