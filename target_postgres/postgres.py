@@ -823,6 +823,21 @@ class PostgresTarget(SQLInterface):
                                 view_name=sql.Identifier(view_name),
                             ))
 
+                        # Write the clean path onto the staging table in the swap's own
+                        # transaction, so the live table is never committed carrying the
+                        # staging path. In that state a concurrent load finds no table
+                        # for the clean path, creates `<name>__1`, and two tables end up
+                        # claiming one path (PQ-4755). commit=False: a separate commit
+                        # reopens that window, and a failed swap would then leave the
+                        # staging table claiming the live path.
+                        metadata = self._get_table_metadata(cur, versioned_table_name)
+                        metadata['path'] = table_path
+                        self.LOGGER.info('Activating {}, setting path to {}'.format(
+                            metadata,
+                            table_path
+                        ))
+                        self._set_table_metadata(cur, versioned_table_name, metadata, commit=False)
+
                         if live_exists:
                             # Atomic 3-step swap: live -> old, staging -> live, drop old.
                             cur.execute(sql.SQL('''
@@ -913,16 +928,6 @@ class PostgresTarget(SQLInterface):
                                     ex)
                                 self.LOGGER.exception(message)
                                 self.conn.rollback()
-
-                        metadata = self._get_table_metadata(cur, table_name)
-
-                        self.LOGGER.info('Activated {}, setting path to {}'.format(
-                            metadata,
-                            table_path
-                        ))
-
-                        metadata['path'] = table_path
-                        self._set_table_metadata(cur, table_name, metadata)
             except Exception as ex:
                 message = '{} - Exception activating table version {}'.format(
                     stream_buffer.stream,
@@ -1262,20 +1267,23 @@ class PostgresTarget(SQLInterface):
             table_name=sql.Identifier(table_name),
             column_names=sql.SQL(', ').join(sql.Identifier(column_name) for column_name in column_names)))
 
-    def _set_table_metadata(self, cur, table_name, metadata):
+    def _set_table_metadata(self, cur, table_name, metadata, commit=True):
         """
         Given a Metadata dict, set it as the comment on the given table.
         :param self: Postgres
         :param cur: Pscyopg.Cursor
         :param table_name: String
         :param metadata: Metadata Dict
+        :param commit: Commit the transaction. Pass False to make the comment part of
+                       a larger transaction the caller commits.
         :return: None
         """
         cur.execute(sql.SQL('COMMENT ON TABLE {}.{} IS {};').format(
             sql.Identifier(self.postgres_schema),
             sql.Identifier(table_name),
             sql.Literal(json.dumps(metadata))))
-        cur.connection.commit()
+        if commit:
+            cur.connection.commit()
 
     def _get_table_metadata(self, cur, table_name):
         cur.execute(sql.SQL('''
