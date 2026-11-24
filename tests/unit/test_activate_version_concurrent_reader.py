@@ -76,9 +76,9 @@ def test_version_bump_never_exposes_staging_path_to_concurrent_reader(db_cleanup
 
 
 def test_failed_swap_leaves_no_second_claim_on_live_path(db_cleanup):
-    # The clean path is written onto the staging table before the swap. If that
-    # write committed separately, an aborted swap would leave the orphaned staging
-    # table claiming the live path next to the live table: the same duplicate.
+    # The clean path commits together with the swap. An aborted swap must leave the
+    # orphaned staging table on its own staging path, so the live table remains the
+    # only one claiming the clean path.
     main(CONFIG, input_stream=CatStream(20, version=1, nested_count=0))
 
     # `cats__old` already existing makes the swap's first ALTER fail.
