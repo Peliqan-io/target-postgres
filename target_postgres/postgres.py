@@ -843,7 +843,20 @@ class PostgresTarget(SQLInterface):
                                 table_schema=sql.Identifier(self.postgres_schema),
                                 stream_table=sql.Identifier(table_name),
                                 version_table=sql.Identifier(versioned_table_name)))
-                        
+
+                        # Fix the path in the swap's own transaction. Committed separately
+                        # later, the live table was visible with the staging path in between,
+                        # and a concurrent load created `<name>__1` for it (PQ-4755).
+                        metadata = self._get_table_metadata(cur, table_name)
+
+                        self.LOGGER.info('Activated {}, setting path to {}'.format(
+                            metadata,
+                            table_path
+                        ))
+
+                        metadata['path'] = table_path
+                        self._set_table_metadata(cur, table_name, metadata)
+
                         self.conn.commit()
 
                         # re-create all views
@@ -913,16 +926,6 @@ class PostgresTarget(SQLInterface):
                                     ex)
                                 self.LOGGER.exception(message)
                                 self.conn.rollback()
-
-                        metadata = self._get_table_metadata(cur, table_name)
-
-                        self.LOGGER.info('Activated {}, setting path to {}'.format(
-                            metadata,
-                            table_path
-                        ))
-
-                        metadata['path'] = table_path
-                        self._set_table_metadata(cur, table_name, metadata)
             except Exception as ex:
                 message = '{} - Exception activating table version {}'.format(
                     stream_buffer.stream,
